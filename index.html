@@ -1,0 +1,2012 @@
+<!doctype html>
+<html>
+    <head>
+        <title>Super Pixel Bros</title>
+    </head>
+    <body style="margin:0; background:#222; display:grid; place-items:center; height:100vh">
+        <canvas id="game" width="800" height="450" style="image-rendering:pixelated; cursor:pointer"></canvas>
+        <script>
+            const canvas = document.getElementById("game");
+            const ctx = canvas.getContext("2d");
+            const W = canvas.width, H = canvas.height;
+
+            // =====================================================
+            // SOUND EFFECTS (Web Audio, no files needed)
+            // =====================================================
+            let audio = null;
+            let muted = false;
+            function initAudio() {
+                if (!audio) audio = new AudioContext();
+                if (audio.state === "suspended") audio.resume();
+            }
+
+            // one note at an exact audio time, sliding from one pitch to another
+            function playNote(type, fromHz, toHz, startTime, duration, volume) {
+                const osc = audio.createOscillator();
+                const gain = audio.createGain();
+                osc.type = type;
+                osc.frequency.setValueAtTime(fromHz, startTime);
+                osc.frequency.exponentialRampToValueAtTime(toHz, startTime + duration);
+                gain.gain.setValueAtTime(volume, startTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+                osc.connect(gain).connect(audio.destination);
+                osc.start(startTime);
+                osc.stop(startTime + duration);
+            }
+
+            function tone(type, fromHz, toHz, duration, volume = 0.15, delay = 0) {
+                if (!audio || muted) return;
+                playNote(type, fromHz, toHz, audio.currentTime + delay, duration, volume);
+            }
+
+            // play a little melody, one note after another
+            function melody(freqs, noteLength, volume = 0.1) {
+                freqs.forEach((hz, i) => tone("square", hz, hz, noteLength, volume, i * noteLength));
+            }
+
+            // white noise, for thunder, rain and lava sizzles
+            let noiseBuffer = null;
+            function getNoise() {
+                if (!noiseBuffer) {
+                    noiseBuffer = audio.createBuffer(1, audio.sampleRate * 2, audio.sampleRate);
+                    const data = noiseBuffer.getChannelData(0);
+                    for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+                }
+                return noiseBuffer;
+            }
+            function noise(duration, volume, filterHz, delay = 0) {
+                if (!audio || muted) return;
+                const t = audio.currentTime + delay;
+                const src = audio.createBufferSource();
+                src.buffer = getNoise();
+                const filter = audio.createBiquadFilter();
+                filter.type = "lowpass";
+                filter.frequency.value = filterHz;
+                const gain = audio.createGain();
+                gain.gain.setValueAtTime(0.001, t);
+                gain.gain.linearRampToValueAtTime(volume, t + 0.05);
+                gain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+                src.connect(filter).connect(gain).connect(audio.destination);
+                src.start(t);
+                src.stop(t + duration);
+            }
+
+            const sounds = {
+                select: () => tone("square", 660, 660, 0.06, 0.08),
+                jump: () => tone("square", 260, 820, 0.18, 0.12),
+                swim: () => tone("sine", 350, 700, 0.12, 0.12),
+                land: () => tone("triangle", 140, 50, 0.08, 0.25),
+                bonk: () => tone("square", 180, 90, 0.1, 0.12),
+                coin: () => {
+                    tone("square", 988, 988, 0.08, 0.1);
+                    tone("square", 1319, 1319, 0.3, 0.1, 0.08);
+                },
+                sprout: () => tone("square", 200, 800, 0.4, 0.1),
+                powerup: () => melody([523, 659, 784, 1047, 1319, 1568], 0.06),
+                stomp: () => tone("triangle", 500, 110, 0.15, 0.3),
+                kick: () => tone("square", 900, 250, 0.12, 0.12),
+                fall: () => {
+                    tone("square", 600, 300, 0.2, 0.1);
+                    tone("square", 300, 120, 0.35, 0.1, 0.2);
+                },
+                sizzle: () => noise(0.7, 0.35, 4000),
+                thunder: () => {
+                    noise(0.3, 0.4, 3000);
+                    noise(2.5, 0.6, 250, 0.15);
+                },
+                die: () => melody([659, 622, 587, 554, 523, 392, 262], 0.13),
+                flagpole: () => tone("square", 1400, 200, 0.9, 0.08),
+                win: () => {
+                    melody([392, 523, 659, 784, 1047, 1319], 0.1);
+                    tone("square", 1568, 1568, 0.6, 0.1, 0.6);
+                },
+            };
+
+            // steady rain noise while a stormy level is showing
+            let rainNode = null;
+            function updateAmbientSound() {
+                const want = audio && !muted && level.theme === "storm";
+                if (want && !rainNode) {
+                    rainNode = audio.createBufferSource();
+                    rainNode.buffer = getNoise();
+                    rainNode.loop = true;
+                    const filter = audio.createBiquadFilter();
+                    filter.type = "highpass";
+                    filter.frequency.value = 1200;
+                    const gain = audio.createGain();
+                    gain.gain.value = 0.05;
+                    rainNode.connect(filter).connect(gain).connect(audio.destination);
+                    rainNode.start();
+                } else if (!want && rainNode) {
+                    rainNode.stop();
+                    rainNode = null;
+                }
+            }
+
+            // =====================================================
+            // MUSIC
+            // Each song has tracks of notes, one per eighth note.
+            // "-" = rest, "~" = keep holding the previous note, "|" = bar line (ignored)
+            // =====================================================
+            const NOTE_INDEX = { C: 0, "C#": 1, D: 2, "D#": 3, E: 4, F: 5, "F#": 6, G: 7, "G#": 8, A: 9, "A#": 10, B: 11 };
+            function hz(note) {
+                const [, name, octave] = note.match(/^([A-G]#?)(\d)$/);
+                const midi = NOTE_INDEX[name] + (Number(octave) + 1) * 12;
+                return 440 * Math.pow(2, (midi - 69) / 12);
+            }
+            function track(wave, volume, notes) {
+                return { wave, volume, notes: notes.split(/\s+/).filter(n => n && n !== "|") };
+            }
+
+            const SONGS = {
+                title: { bpm: 140, tracks: [
+                    track("square", 0.035, "G4 C5 E5 G5 ~ E5 G5 ~ | A5 ~ G5 ~ E5 ~ C5 ~ | D5 E5 F5 D5 ~ B4 G4 ~ | C5 ~ ~ ~ ~ - - -"),
+                    track("triangle", 0.09, "C3 - G3 - C3 - G3 - | F3 - C3 - F3 - C3 - | G2 - D3 - G2 - B2 - | C3 - G2 - C3 - - -"),
+                ]},
+                overworld: { bpm: 150, tracks: [
+                    track("square", 0.035, `
+                        C5 E5 G5 E5 F5 A5 G5 ~ | E5 G5 C6 G5 A5 F5 D5 ~ | C5 E5 G5 E5 F5 D5 B4 ~ | C5 ~ G4 ~ C5 ~ ~ -
+                        A4 C5 E5 C5 D5 F5 E5 ~ | C5 E5 A5 E5 F5 D5 B4 ~ | G4 B4 D5 F5 E5 D5 C5 ~ | D5 ~ G4 ~ B4 ~ D5 ~`),
+                    track("triangle", 0.09, `
+                        C3 - G3 - F3 - G3 - | C3 - E3 - F3 - G3 - | C3 - G3 - F3 - G3 - | C3 - G2 - C3 - G2 -
+                        A2 - E3 - D3 - A3 - | A2 - E3 - D3 - A3 - | G2 - D3 - C3 - G3 - | G2 - D3 - G2 - B2 -`),
+                ]},
+                water: { bpm: 110, tracks: [
+                    track("sine", 0.08, `
+                        E5 ~ ~ G5 ~ A5 | G5 ~ ~ E5 ~ ~ | D5 ~ ~ E5 ~ D5 | C5 ~ ~ ~ ~ -
+                        E5 ~ ~ G5 ~ A5 | B5 ~ ~ C6 ~ ~ | B5 ~ ~ G5 ~ A5 | G5 ~ ~ ~ ~ -`),
+                    track("triangle", 0.08, `
+                        C3 - G3 - E3 - | A2 - E3 - C3 - | F2 - C3 - A2 - | G2 - D3 - B2 -
+                        C3 - G3 - E3 - | A2 - E3 - C3 - | F2 - C3 - A2 - | G2 - D3 - G2 -`),
+                ]},
+                castle: { bpm: 130, tracks: [
+                    track("square", 0.03, `
+                        A4 ~ C5 ~ E5 ~ D#5 ~ | E5 ~ C5 ~ A4 ~ ~ - | F4 ~ A4 ~ D5 ~ C#5 ~ | D5 ~ A4 ~ F4 ~ ~ -
+                        A4 C5 E5 A5 G#5 ~ E5 ~ | F5 ~ D5 ~ B4 ~ G#4 ~ | A4 ~ E4 ~ A4 ~ B4 ~ | C5 ~ B4 ~ A4 ~ ~ -`),
+                    track("triangle", 0.1, `
+                        A2 A2 A2 A2 A2 A2 A2 A2 | A2 A2 A2 A2 A2 A2 A2 A2 | D2 D2 D2 D2 D2 D2 D2 D2 | D2 D2 D2 D2 D2 D2 D2 D2
+                        A2 A2 A2 A2 E2 E2 E2 E2 | D2 D2 D2 D2 E2 E2 E2 E2 | A2 A2 A2 A2 E2 E2 E2 E2 | A2 A2 E2 E2 A2 - - -`),
+                ]},
+                storm: { bpm: 160, tracks: [
+                    track("square", 0.03, `
+                        E5 ~ E5 D5 E5 ~ G5 ~ | F#5 ~ E5 ~ D5 ~ B4 ~ | E5 ~ E5 D5 E5 ~ B5 ~ | A5 ~ G5 ~ F#5 ~ ~ -
+                        C5 ~ E5 ~ G5 ~ E5 ~ | D5 ~ F#5 ~ A5 ~ F#5 ~ | B4 ~ D5 ~ F#5 ~ B5 ~ | A5 ~ G5 ~ F#5 ~ E5 ~`),
+                    track("triangle", 0.1, `
+                        E2 E3 E2 E3 E2 E3 E2 E3 | D2 D3 D2 D3 D2 D3 D2 D3 | E2 E3 E2 E3 E2 E3 E2 E3 | B1 B2 B1 B2 B1 B2 B1 B2
+                        C2 C3 C2 C3 C2 C3 C2 C3 | D2 D3 D2 D3 D2 D3 D2 D3 | B1 B2 B1 B2 B1 B2 B1 B2 | B1 B2 B1 B2 B1 B2 B1 B2`),
+                ]},
+                star: { bpm: 200, tracks: [
+                    track("square", 0.035, "G5 C6 E6 C6 G5 C6 E6 G6 | F5 A5 C6 A5 G5 B5 D6 G6"),
+                    track("triangle", 0.1,  "C3 C4 C3 C4 C3 C4 C3 C4 | F2 F3 F2 F3 G2 G3 G2 G3"),
+                ]},
+            };
+
+            const music = { song: null, step: 0, nextTime: 0 };
+            function playSong(song) {
+                if (music.song === song) return;
+                music.song = song;
+                music.step = 0;
+                music.nextTime = 0;
+            }
+            function stopMusic() { music.song = null; }
+
+            // schedule notes slightly ahead of time so the music never stutters
+            setInterval(() => {
+                if (!audio || !music.song) return;
+                const song = music.song;
+                const stepLength = 60 / song.bpm / 2;
+                if (music.nextTime < audio.currentTime) music.nextTime = audio.currentTime + 0.05;
+                while (music.nextTime < audio.currentTime + 0.15) {
+                    for (const t of song.tracks) {
+                        const i = music.step % t.notes.length;
+                        const note = t.notes[i];
+                        if (muted || note === "-" || note === "~") continue;
+                        let steps = 1;
+                        while (t.notes[i + steps] === "~") steps++;
+                        const freq = hz(note);
+                        playNote(t.wave, freq, freq, music.nextTime, stepLength * steps * 0.95, t.volume);
+                    }
+                    music.nextTime += stepLength;
+                    music.step++;
+                }
+            }, 25);
+
+            // =====================================================
+            // CHARACTERS (12x16 pixel sprites; each letter is a color)
+            // =====================================================
+            const BRO_TOP = [
+                "...RRRRR....",
+                "..RRRRRRRRR.",
+                "..BBBSSKS...",
+                ".BSBSSSKSSS.",
+                ".BSBBSSSBSSS",
+                ".BBSSSSBBBB.",
+                "...SSSSSSS..",
+                "..RROORR....",
+                ".RRROORRORR.",
+                "RRRROOOORRRR",
+                "SSROYOOYORSS",
+                "SSSOOOOOOSSS",
+            ];
+            const BRO_LEGS = {
+                stand: ["SSOOOOOOOOSS", "..OOO..OOO..", ".BBB....BBB.", "BBBB....BBBB"],
+                walk1: ["..OOOOOOOO..", ".OOO....OOO.", "BBB......BBB", "BB........BB"],
+                walk2: ["...OOOOOO...", "....OOOO....", "....BBBB....", "...BBBBB...."],
+                jump:  ["SOOOOOOOOO..", "OOO....OOO..", "BB......BBB.", "B.........BB"],
+            };
+            const TOAD_TOP = [
+                "...WWWWWW...",
+                ".WWRRWWRRWW.",
+                "WWRRRWWRRRWW",
+                "WRRWWWWWWRRW",
+                "WWWWWWWWWWWW",
+                "..SSSSSSSS..",
+                "..SKSSSSKS..",
+                "..SKSSSSKS..",
+                "...SSSSSS...",
+                "..OOWWWWOO..",
+                ".SOOWWWWOOS.",
+                "SS.OOWWOO.SS",
+            ];
+            // same legs as the bros, but with white pants
+            const TOAD_LEGS = Object.fromEntries(Object.entries(BRO_LEGS).map(([k, rows]) => [k, rows.map(r => r.replace(/O/g, "W"))]));
+            const PEACH_TOP = [
+                "...Y.Y.Y....",
+                "...YYYYY....",
+                "..HHHHHHH...",
+                ".HHSSSSSHH..",
+                ".HSSKSKSSH..",
+                ".HSSSSSSSHH.",
+                ".HHSSPSSSHH.",
+                ".HHHSSSSHHH.",
+                "..HPPPPPPH..",
+                ".SPPPGPPPPS.",
+                "SS.PPPPPP.SS",
+                "...PPPPPP...",
+            ];
+            const PEACH_LEGS = {
+                stand: ["..PPPPPPPP..", ".PPDPPPPDPP.", "PPPPPPPPPPPP", "..BB....BB.."],
+                walk1: ["..PPPPPPPP..", ".PPDPPPPDPP.", "PPPPPPPPPPP.", ".BB......BB."],
+                walk2: ["..PPPPPPPP..", ".PPDPPPPDPP.", ".PPPPPPPPPPP", "...BB..BB..."],
+                jump:  ["..PPPPPPPP..", "PPPDPPPPDPPP", "PPPPPPPPPPPP", ".B........B."],
+            };
+
+            const CHARACTERS = [
+                {
+                    name: "Mario", desc: "All-rounder", stats: [3, 3],
+                    top: BRO_TOP, legs: BRO_LEGS, speed: 4, jump: -13,
+                    colors: { R: "#e52521", S: "#fcb68b", B: "#6b3a12", O: "#2048d8", Y: "#ffd23f", K: "#111" },
+                },
+                {
+                    name: "Luigi", desc: "Jumps highest", stats: [3, 5],
+                    top: BRO_TOP, legs: BRO_LEGS, speed: 3.8, jump: -14.8,
+                    colors: { R: "#2fa84f", S: "#fcb68b", B: "#6b3a12", O: "#1f3a9e", Y: "#ffd23f", K: "#111" },
+                },
+                {
+                    name: "Toad", desc: "Runs fastest", stats: [5, 2],
+                    top: TOAD_TOP, legs: TOAD_LEGS, speed: 5.3, jump: -12.3,
+                    colors: { W: "#fff", R: "#e52521", S: "#fcd5b0", K: "#111", O: "#2048d8", B: "#6b3a12" },
+                },
+                {
+                    name: "Peach", desc: "Hold jump to float", stats: [3, 3],
+                    top: PEACH_TOP, legs: PEACH_LEGS, speed: 3.8, jump: -12.8, float: true,
+                    colors: { Y: "#ffd23f", H: "#f7c948", S: "#fcd5b0", K: "#111", P: "#ff7eb6", D: "#e0559a", G: "#3fa9f5", B: "#c2185b" },
+                },
+            ];
+
+            // sprites are painted onto a tiny 12x16 canvas, then scaled up
+            const spriteCanvas = document.createElement("canvas");
+            spriteCanvas.width = 12;
+            spriteCanvas.height = 16;
+            const sctx = spriteCanvas.getContext("2d");
+
+            function drawCharacter(ch, pose, x, y, scale, facing, rainbowHue) {
+                sctx.clearRect(0, 0, 12, 16);
+                ch.top.concat(ch.legs[pose]).forEach((row, ry) => {
+                    for (let rx = 0; rx < row.length; rx++) {
+                        const c = ch.colors[row[rx]];
+                        if (!c) continue;
+                        sctx.fillStyle = c;
+                        sctx.fillRect(rx, ry, 1, 1);
+                    }
+                });
+                if (rainbowHue !== null) {
+                    // tint only the sprite's pixels, not the empty space around it
+                    sctx.globalCompositeOperation = "source-atop";
+                    sctx.fillStyle = `hsla(${rainbowHue}, 100%, 60%, 0.6)`;
+                    sctx.fillRect(0, 0, 12, 16);
+                    sctx.globalCompositeOperation = "source-over";
+                }
+                ctx.save();
+                ctx.imageSmoothingEnabled = false;
+                ctx.translate(x + (facing < 0 ? 12 * scale : 0), y);
+                ctx.scale(facing, 1);
+                ctx.drawImage(spriteCanvas, 0, 0, 12 * scale, 16 * scale);
+                ctx.restore();
+            }
+
+            // =====================================================
+            // LEVELS
+            // =====================================================
+            const GROUND_Y = 400;
+            const STAR_TIME = 30 * 60; // 30 seconds at 60 frames per second
+
+            const PHYSICS = {
+                land:  { gravity: 0.6,  maxFall: 15,  swim: false },
+                water: { gravity: 0.22, maxFall: 3.5, swim: true, speed: 3, jump: -5.5 },
+            };
+            const physics = () => level.theme === "water" ? PHYSICS.water : PHYSICS.land;
+
+            const LEVELS = [
+                {
+                    name: "1-1",
+                    subtitle: "Grassy Hills",
+                    theme: "overworld",
+                    music: SONGS.overworld,
+                    width: 3000,
+                    pole: { x: 2780, top: 150 },
+                    castle: { x: 2860, w: 110 },
+                    platforms: [
+                        { x: 0,    y: GROUND_Y, w: 1700, h: 50, ground: true },
+                        { x: 1820, y: GROUND_Y, w: 1180, h: 50, ground: true }, // gap before this = pit
+                        { x: 200,  y: 320, w: 120,  h: 20 },
+                        { x: 400,  y: 250, w: 120,  h: 20 },
+                        { x: 700,  y: 320, w: 150,  h: 20 },
+                        { x: 1000, y: 260, w: 120,  h: 20 },
+                        { x: 1300, y: 330, w: 200,  h: 20 },
+                        { x: 1600, y: 280, w: 120,  h: 20 },
+                        { x: 2000, y: 320, w: 120,  h: 20 },
+                        { x: 2200, y: 250, w: 150,  h: 20 },
+                        { x: 2450, y: 300, w: 120,  h: 20 },
+                        // mystery boxes — hit them from below
+                        { x: 580,  y: 260, w: 30, h: 30, box: "coin" },
+                        { x: 1200, y: 250, w: 30, h: 30, box: "star" },
+                        { x: 1880, y: 270, w: 30, h: 30, box: "coin" },
+                    ],
+                    coins: [
+                        [230, 290], [260, 290], [290, 290],
+                        [430, 220], [460, 220], [490, 220],
+                        [560, 370], [600, 370],
+                        [735, 290], [775, 290], [815, 290],
+                        [1030, 230], [1060, 230], [1090, 230],
+                        [1340, 300], [1380, 300], [1420, 300], [1460, 300],
+                        [1735, 250], [1765, 230], [1795, 250], // arc over the pit
+                        [2030, 290], [2060, 290], [2090, 290],
+                        [2235, 220], [2275, 220], [2315, 220],
+                        [2480, 270], [2510, 270], [2540, 270],
+                        [2600, 370], [2640, 370], [2680, 370],
+                    ],
+                    // enemies walk back and forth between min and max
+                    enemies: [
+                        { kind: "walker", x: 600,  y: 372, min: 500,  max: 680 },
+                        { kind: "walker", x: 1150, y: 372, min: 900,  max: 1280 },
+                        { kind: "walker", x: 1400, y: 302, min: 1300, max: 1470 },
+                        { kind: "walker", x: 1950, y: 372, min: 1840, max: 2150 },
+                        { kind: "walker", x: 2280, y: 222, min: 2200, max: 2320 },
+                        { kind: "walker", x: 2450, y: 372, min: 2300, max: 2600 },
+                    ],
+                    decor: [140, 560, 900, 1500, 2100, 2500], // bushes
+                },
+                {
+                    name: "1-2",
+                    subtitle: "Under the Sea",
+                    theme: "water",
+                    music: SONGS.water,
+                    width: 3000,
+                    pole: { x: 2780, top: 150 },
+                    castle: { x: 2860, w: 110 },
+                    platforms: [
+                        { x: 0,    y: GROUND_Y, w: 900,  h: 50, ground: true },
+                        { x: 1050, y: GROUND_Y, w: 800,  h: 50, ground: true },
+                        { x: 2000, y: GROUND_Y, w: 1000, h: 50, ground: true },
+                        { x: 300,  y: 300, w: 100, h: 20 },
+                        { x: 600,  y: 220, w: 140, h: 20 },
+                        { x: 950,  y: 280, w: 80,  h: 20 },
+                        { x: 1250, y: 160, w: 120, h: 20 },
+                        { x: 1400, y: 330, w: 40,  h: 70 },  // rock pillar
+                        { x: 1500, y: 300, w: 160, h: 20 },
+                        { x: 1900, y: 250, w: 100, h: 20 },
+                        { x: 2150, y: 300, w: 40,  h: 100 }, // rock pillar
+                        { x: 2250, y: 180, w: 140, h: 20 },
+                        { x: 2500, y: 300, w: 120, h: 20 },
+                        { x: 780,  y: 250, w: 30, h: 30, box: "coin" },
+                        { x: 1700, y: 220, w: 30, h: 30, box: "star" },
+                        { x: 2050, y: 260, w: 30, h: 30, box: "coin" },
+                    ],
+                    coins: [
+                        [150, 350], [190, 330], [230, 350],
+                        [330, 270], [360, 270],
+                        [630, 190], [670, 190], [710, 190],
+                        [840, 330], [870, 310], [900, 330],
+                        [975, 250], [1005, 250],
+                        [1100, 200], [1130, 170], [1160, 200],
+                        [1280, 130], [1310, 130], [1340, 130],
+                        [1550, 270], [1590, 270], [1630, 270],
+                        [1880, 340], [1920, 220], [1960, 220],
+                        [2280, 150], [2320, 150], [2360, 150],
+                        [2530, 270], [2570, 270],
+                        [2650, 350], [2690, 350],
+                    ],
+                    enemies: [
+                        { kind: "fish", x: 500,  y: 340, min: 420,  max: 850 },
+                        { kind: "fish", x: 800,  y: 150, min: 650,  max: 950 },
+                        { kind: "fish", x: 1200, y: 300, min: 1060, max: 1380 },
+                        { kind: "fish", x: 1700, y: 340, min: 1450, max: 1800 },
+                        { kind: "fish", x: 2100, y: 200, min: 2000, max: 2230 },
+                        { kind: "fish", x: 2400, y: 340, min: 2200, max: 2700 },
+                    ],
+                    decor: [80, 260, 520, 760, 1120, 1320, 1600, 1760, 2080, 2300, 2450, 2650], // seaweed
+                },
+                {
+                    name: "1-3",
+                    subtitle: "Lava Castle",
+                    theme: "castle",
+                    music: SONGS.castle,
+                    width: 3000,
+                    pole: { x: 2780, top: 150 },
+                    castle: { x: 2860, w: 110 },
+                    platforms: [
+                        // stone floor with lava between the pieces
+                        { x: 0,    y: GROUND_Y, w: 500, h: 50, ground: true },
+                        { x: 620,  y: GROUND_Y, w: 380, h: 50, ground: true },
+                        { x: 1150, y: GROUND_Y, w: 300, h: 50, ground: true },
+                        { x: 1600, y: GROUND_Y, w: 450, h: 50, ground: true },
+                        { x: 2200, y: GROUND_Y, w: 800, h: 50, ground: true },
+                        // stepping stones over the lava
+                        { x: 520,  y: 330, w: 60,  h: 20 },
+                        { x: 1040, y: 320, w: 70,  h: 20 },
+                        { x: 1480, y: 300, w: 80,  h: 20 },
+                        { x: 2100, y: 310, w: 60,  h: 20 },
+                        // ledges
+                        { x: 300,  y: 300, w: 100, h: 20 },
+                        { x: 750,  y: 260, w: 120, h: 20 },
+                        { x: 1250, y: 250, w: 120, h: 20 },
+                        { x: 1700, y: 280, w: 150, h: 20 },
+                        { x: 1900, y: 200, w: 100, h: 20 },
+                        { x: 2350, y: 260, w: 140, h: 20 },
+                        { x: 2550, y: 320, w: 100, h: 20 },
+                        { x: 420,  y: 260, w: 30, h: 30, box: "coin" },
+                        { x: 1180, y: 260, w: 30, h: 30, box: "star" },
+                        { x: 2250, y: 260, w: 30, h: 30, box: "coin" },
+                    ],
+                    coins: [
+                        [320, 270], [350, 270], [380, 270],
+                        [540, 300], [560, 280],
+                        [780, 230], [810, 230], [840, 230],
+                        [1060, 290], [1090, 290],
+                        [1280, 220], [1310, 220], [1340, 220],
+                        [1500, 270], [1530, 270],
+                        [1730, 250], [1770, 250], [1810, 250],
+                        [1920, 170], [1950, 170], [1980, 170],
+                        [2110, 280], [2140, 280],
+                        [2380, 230], [2420, 230], [2460, 230],
+                        [2600, 370], [2640, 370], [2680, 370],
+                    ],
+                    enemies: [
+                        { kind: "walker",   x: 800,  y: 372, min: 640,  max: 970 },
+                        { kind: "walker",   x: 1300, y: 372, min: 1160, max: 1420 },
+                        { kind: "walker",   x: 1750, y: 252, min: 1700, max: 1820 },
+                        { kind: "walker",   x: 1800, y: 372, min: 1620, max: 2020 },
+                        { kind: "walker",   x: 2500, y: 372, min: 2220, max: 2700 },
+                        // fireballs leap out of the lava — they can't be stomped!
+                        { kind: "fireball", x: 595,  delay: 0 },
+                        { kind: "fireball", x: 1120, delay: 50 },
+                        { kind: "fireball", x: 1570, delay: 100 },
+                        { kind: "fireball", x: 2170, delay: 25 },
+                    ],
+                    decor: [100, 450, 800, 1200, 1550, 1900, 2300, 2650], // torches
+                },
+                {
+                    name: "1-4",
+                    subtitle: "Stormy Skies",
+                    theme: "storm",
+                    music: SONGS.storm,
+                    width: 3000,
+                    pole: { x: 2780, top: 150 },
+                    castle: { x: 2860, w: 110 },
+                    platforms: [
+                        { x: 0,    y: GROUND_Y, w: 800, h: 50, ground: true },
+                        { x: 950,  y: GROUND_Y, w: 600, h: 50, ground: true },
+                        { x: 1700, y: GROUND_Y, w: 500, h: 50, ground: true },
+                        { x: 2320, y: GROUND_Y, w: 680, h: 50, ground: true },
+                        { x: 250,  y: 310, w: 120, h: 20 },
+                        { x: 500,  y: 240, w: 120, h: 20 },
+                        { x: 830,  y: 300, w: 80,  h: 20 },
+                        { x: 1100, y: 280, w: 150, h: 20 },
+                        { x: 1350, y: 200, w: 120, h: 20 },
+                        { x: 1600, y: 300, w: 70,  h: 20 },
+                        { x: 1850, y: 260, w: 140, h: 20 },
+                        { x: 2100, y: 320, w: 80,  h: 20 },
+                        { x: 2230, y: 250, w: 70,  h: 20 },
+                        { x: 2500, y: 280, w: 140, h: 20 },
+                        { x: 650,  y: 260, w: 30, h: 30, box: "coin" },
+                        { x: 1500, y: 260, w: 30, h: 30, box: "star" },
+                        { x: 2400, y: 260, w: 30, h: 30, box: "coin" },
+                    ],
+                    coins: [
+                        [280, 280], [310, 280], [340, 280],
+                        [530, 210], [560, 210], [590, 210],
+                        [700, 370], [740, 370],
+                        [850, 270], [880, 270],
+                        [1130, 250], [1170, 250], [1210, 250],
+                        [1380, 170], [1410, 170], [1440, 170],
+                        [1620, 270], [1650, 270],
+                        [1880, 230], [1920, 230], [1960, 230],
+                        [2120, 290], [2150, 290],
+                        [2250, 220], [2280, 220],
+                        [2530, 250], [2570, 250], [2610, 250],
+                        [2650, 370], [2690, 370],
+                    ],
+                    enemies: [
+                        { kind: "walker", x: 600,  y: 372, min: 400,  max: 770 },
+                        { kind: "walker", x: 1200, y: 372, min: 960,  max: 1520 },
+                        { kind: "walker", x: 1900, y: 232, min: 1850, max: 1960 },
+                        { kind: "walker", x: 2000, y: 372, min: 1720, max: 2170 },
+                        { kind: "walker", x: 2600, y: 372, min: 2340, max: 2740 },
+                        { kind: "crow",   x: 1000, y: 180,  min: 850,  max: 1250 },
+                        { kind: "crow",   x: 1800, y: 150,  min: 1600, max: 2100 },
+                        { kind: "crow",   x: 2450, y: 200,  min: 2300, max: 2700 },
+                    ],
+                    decor: [150, 600, 1100, 1300, 1800, 2000, 2450, 2600], // puddles
+                },
+            ];
+
+            const ENEMY_SIZE = { walker: [30, 28], fish: [32, 24], crow: [30, 20], fireball: [22, 22] };
+            const LAVA_Y = 418;
+
+            // background scenery (x positions are in "parallax space")
+            const clouds = [80, 380, 650, 980, 1300, 1600].map((x, i) => ({ x, y: 40 + (i % 3) * 30, s: 0.8 + (i % 2) * 0.4 }));
+            const hills = [0, 420, 900, 1350, 1800, 2300].map((x, i) => ({ x, r: 90 + (i % 3) * 40 }));
+
+            // =====================================================
+            // GAME STATE
+            // =====================================================
+            const player = { x: 50, y: 100, w: 30, h: 40, vx: 0, vy: 0, onGround: false, facing: 1, walkTime: 0, hidden: false, star: 0, floatTime: 0 };
+            let cameraX = 0;
+            let tick = 0;
+
+            let selectedChar = 0, selectedLevel = 0, selectedKart = 0;
+            let menuMode = "adventure"; // "adventure" | "kart"
+            let menuButtons = [];
+
+            let levelIndex = 0, level = LEVELS[0];
+            let platforms = [], coins = [], enemies = [], stars = [], popCoins = [], flagY = 0;
+            let score = 0, coinCount = 0, levelStartScore = 0, levelStartCoins = 0;
+            let state = "menu"; // "menu" | "playing" | "dead" | "won"
+            let stateTimer = 0;
+            let winPhase;       // "slide" | "walk" | "done"
+            let bannerTimer = 0;
+            let jumpWasDown = false;
+
+            // weather
+            let wind = 0, lightning = 0, bolt = [];
+            const rain = Array.from({ length: 160 }, () => ({
+                x: Math.random() * W, y: Math.random() * H, len: 8 + Math.random() * 10, speed: 9 + Math.random() * 5,
+            }));
+
+            const particles = [];
+            const floaters = []; // "+200" style score popups
+
+            function puff(x, y, count, kind) {
+                const bubble = level.theme === "water";
+                for (let i = 0; i < count; i++) {
+                    particles.push({
+                        x, y,
+                        vx: (Math.random() - 0.5) * (bubble ? 1 : 3),
+                        vy: bubble ? -0.5 - Math.random() : -Math.random() * 1.5,
+                        life: bubble ? 60 + Math.random() * 30 : 20 + Math.random() * 10,
+                        bubble,
+                        ember: kind === "ember",
+                        r: bubble ? 2 + Math.random() * 3 : 3,
+                    });
+                }
+            }
+            function popup(x, y, text) {
+                floaters.push({ x, y, text, life: 45 });
+            }
+
+            // =====================================================
+            // MENU / LEVEL FLOW
+            // =====================================================
+            function goToMenu() {
+                state = "menu";
+                level = menuMode === "kart" ? LEVELS[0] : LEVELS[selectedLevel];
+                cameraX = 0;
+                particles.length = 0;
+                floaters.length = 0;
+                playSong(SONGS.title);
+            }
+
+            function startGame() {
+                score = 0;
+                coinCount = 0;
+                loadLevel(selectedLevel);
+            }
+
+            // kart racing lives in kart.js
+            function startKart() {
+                state = "kart";
+                level = LEVELS[0];
+                Kart.start(selectedKart, CHARACTERS[selectedChar]);
+            }
+
+            function switchMenuMode() {
+                menuMode = menuMode === "kart" ? "adventure" : "kart";
+                level = menuMode === "kart" ? LEVELS[0] : LEVELS[selectedLevel];
+                sounds.select();
+            }
+
+            function loadLevel(index) {
+                levelIndex = index;
+                level = LEVELS[index];
+                levelStartScore = score;
+                levelStartCoins = coinCount;
+                resetLevel();
+            }
+
+            // restart the current level (also used after dying)
+            function resetLevel() {
+                Object.assign(player, { x: 50, y: 100, vx: 0, vy: 0, onGround: false, facing: 1, walkTime: 0, hidden: false, star: 0, floatTime: 0 });
+                platforms = level.platforms.map(p => ({ ...p, used: false, bump: 0 }));
+                coins = level.coins.map(([x, y]) => ({ x, y, taken: false }));
+                enemies = level.enemies.map(e => {
+                    const [w, h] = ENEMY_SIZE[e.kind];
+                    const y = e.kind === "fireball" ? H + 10 : e.y;
+                    return { ...e, y, baseY: y, w, h, vx: e.kind === "fireball" ? 0 : -1, vy: 0, squashed: 0, knocked: false, dead: false };
+                });
+                stars = [];
+                popCoins = [];
+                score = levelStartScore;
+                coinCount = levelStartCoins;
+                flagY = level.pole.top + 10;
+                state = "playing";
+                stateTimer = 0;
+                bannerTimer = 150;
+                particles.length = 0;
+                floaters.length = 0;
+                playSong(level.music);
+            }
+
+            function afterCourseClear() {
+                if (levelIndex + 1 < LEVELS.length) loadLevel(levelIndex + 1);
+                else goToMenu();
+            }
+
+            function die(hitByEnemy) {
+                state = "dead";
+                stateTimer = 0;
+                player.vx = 0;
+                player.star = 0;
+                stopMusic();
+                if (hitByEnemy) {
+                    player.vy = -11; // classic pop up, then fall off screen
+                    sounds.die();
+                } else if (level.theme === "castle") {
+                    sounds.sizzle();
+                    puff(player.x + player.w / 2, LAVA_Y, 12);
+                } else {
+                    sounds.fall();
+                }
+            }
+
+            function hitBox(p) {
+                p.used = true;
+                p.bump = 10;
+                if (p.box === "coin") {
+                    coinCount++;
+                    score += 200;
+                    sounds.coin();
+                    popCoins.push({ x: p.x + p.w / 2, y: p.y - 10, vy: -7, life: 28 });
+                    popup(p.x + p.w / 2, p.y - 30, "+200");
+                } else {
+                    // a star slowly rises out of the box, then bounces away
+                    stars.push({ x: p.x + 3, y: p.y, w: 24, h: 24, vx: 2.5, vy: 0, rise: 24, gone: false });
+                    sounds.sprout();
+                }
+            }
+
+            function knockEnemy(e) {
+                e.knocked = true;
+                e.vy = -6;
+                e.vx = player.facing * 2;
+                score += 200;
+                sounds.kick();
+                popup(e.x + e.w / 2, e.y - 10, "+200");
+            }
+
+            // =====================================================
+            // INPUT
+            // =====================================================
+            const keys = {};
+            addEventListener("keydown", e => {
+                initAudio(); // browsers only allow audio after a key press
+                keys[e.code] = true;
+                if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Tab"].includes(e.code)) e.preventDefault();
+                if (e.code === "KeyM") muted = !muted;
+
+                if (state === "kart") {
+                    if (e.code === "Escape") { Kart.stop(); goToMenu(); }
+                    else Kart.keydown(e.code);
+                    return;
+                }
+
+                if (state === "menu") {
+                    const n = CHARACTERS.length;
+                    const kart = menuMode === "kart";
+                    const m = kart ? Kart.entries.length : LEVELS.length;
+                    const step = d => {
+                        if (kart) selectedKart = (selectedKart + m + d) % m;
+                        else { selectedLevel = (selectedLevel + m + d) % m; level = LEVELS[selectedLevel]; }
+                        sounds.select();
+                    };
+                    if (e.code === "ArrowLeft" || e.code === "KeyA")  { selectedChar = (selectedChar + n - 1) % n; sounds.select(); }
+                    if (e.code === "ArrowRight" || e.code === "KeyD") { selectedChar = (selectedChar + 1) % n; sounds.select(); }
+                    if (e.code === "ArrowUp" || e.code === "KeyW") step(-1);
+                    if (e.code === "ArrowDown" || e.code === "KeyS") step(1);
+                    if (e.code === "Tab") switchMenuMode();
+                    if (e.code === "Enter" || e.code === "Space") kart ? startKart() : startGame();
+                    return;
+                }
+                if (e.code === "Escape") goToMenu();
+                if (e.code === "Enter" && state === "won" && winPhase !== "slide") afterCourseClear();
+            });
+            addEventListener("keyup", e => keys[e.code] = false);
+
+            canvas.addEventListener("click", e => {
+                initAudio();
+                if (state !== "menu") return;
+                const r = canvas.getBoundingClientRect();
+                const mx = (e.clientX - r.left) * W / r.width;
+                const my = (e.clientY - r.top) * H / r.height;
+                for (const b of menuButtons) {
+                    if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) b.action();
+                }
+            });
+
+            // --- helpers ---
+            function overlaps(a, b) {
+                return a.x < b.x + b.w && a.x + a.w > b.x &&
+                    a.y < b.y + b.h && a.y + a.h > b.y;
+            }
+
+            // =====================================================
+            // UPDATE
+            // =====================================================
+            function update() {
+                tick++;
+                if (state === "kart") {
+                    updateAmbientSound();
+                    Kart.update();
+                    return;
+                }
+                updateWeather();
+                updateAmbientSound();
+
+                if (state === "menu") {
+                    cameraX = (cameraX + 1) % (level.width - W); // slowly pan the background
+                    return;
+                }
+
+                if (bannerTimer > 0) bannerTimer--;
+
+                if (state === "playing") updatePlaying();
+                else if (state === "dead") updateDead();
+                else if (state === "won") updateWon();
+
+                if (state !== "dead") {
+                    updateEnemies();
+                    updateStars();
+                }
+
+                for (const p of platforms) if (p.bump > 0) p.bump--;
+
+                // ambient bubbles under water, embers over lava
+                if (level.theme === "water" && tick % 25 === 0) puff(cameraX + Math.random() * W, GROUND_Y, 1);
+                if (level.theme === "castle" && tick % 6 === 0) {
+                    particles.push({ x: cameraX + Math.random() * W, y: LAVA_Y, vx: (Math.random() - 0.5) * 0.5, vy: -1 - Math.random(),
+                        life: 40 + Math.random() * 40, ember: true, r: 1.5 });
+                }
+
+                // particles, score popups, coins popping out of boxes
+                for (const pt of particles) {
+                    pt.x += pt.vx + (pt.bubble ? Math.sin((tick + pt.y) * 0.1) * 0.3 : 0);
+                    pt.y += pt.vy;
+                    if (!pt.bubble && !pt.ember) pt.vy += 0.05;
+                    pt.life--;
+                    if (pt.bubble && pt.y < 10) pt.life = 0;
+                }
+                for (const f of floaters) { f.y -= 0.8; f.life--; }
+                for (const c of popCoins) { c.y += c.vy; c.vy += 0.6; c.life--; }
+                removeExpired(particles);
+                removeExpired(floaters);
+                removeExpired(popCoins);
+
+                // camera follows player
+                cameraX = player.x - 300;
+                if (cameraX < 0) cameraX = 0;
+                if (cameraX > level.width - W) cameraX = level.width - W;
+            }
+
+            function removeExpired(list) {
+                for (let i = list.length - 1; i >= 0; i--) if (list[i].life <= 0) list.splice(i, 1);
+            }
+
+            function updateWeather() {
+                if (level.theme !== "storm") { wind = 0; lightning = 0; return; }
+
+                // gusts of wind blow against you every ten seconds or so
+                const cycle = tick % 600;
+                const target = cycle > 300 && cycle < 520 ? -1.3 : 0;
+                wind += (target - wind) * 0.05;
+
+                for (const d of rain) {
+                    d.y += d.speed;
+                    d.x += wind * 3 - 1.5;
+                    if (d.y > H) { d.y = -d.len; d.x = Math.random() * (W + 100); }
+                    if (d.x < -20) d.x += W + 40;
+                }
+
+                if (lightning > 0) lightning--;
+                if (lightning === 0 && Math.random() < 1 / 360) {
+                    lightning = 14;
+                    // a jagged bolt from the top of the sky
+                    bolt = [];
+                    let bx = 100 + Math.random() * (W - 200), by = 0;
+                    while (by < 260) {
+                        bolt.push([bx, by]);
+                        bx += (Math.random() - 0.5) * 50;
+                        by += 20 + Math.random() * 25;
+                    }
+                    bolt.push([bx, by]);
+                    sounds.thunder();
+                }
+            }
+
+            function updatePlaying() {
+                const P = physics();
+                const ch = CHARACTERS[selectedChar];
+                const speed = P.swim ? P.speed * ch.speed / 4 : ch.speed;
+
+                // horizontal movement
+                let inputVx = 0;
+                if (keys["ArrowLeft"] || keys["KeyA"]) inputVx = -speed;
+                if (keys["ArrowRight"] || keys["KeyD"]) inputVx = speed;
+                if (inputVx !== 0) player.facing = Math.sign(inputVx);
+
+                // jump (or swim stroke under water — tap repeatedly to rise)
+                const jumpDown = keys["Space"] || keys["ArrowUp"] || keys["KeyW"];
+                if (P.swim) {
+                    if (jumpDown && !jumpWasDown) {
+                        player.vy = P.jump;
+                        player.onGround = false;
+                        sounds.swim();
+                        puff(player.x + (player.facing > 0 ? player.w : 0), player.y + 10, 3);
+                    }
+                } else if (jumpDown && player.onGround) {
+                    player.vy = ch.jump;
+                    player.onGround = false;
+                    sounds.jump();
+                    puff(player.x + player.w / 2, player.y + player.h, 6);
+                }
+                jumpWasDown = jumpDown;
+
+                // gravity
+                player.vy = Math.min(player.vy + P.gravity, P.maxFall);
+
+                // Peach can hover for a moment by holding jump while falling
+                if (ch.float && !P.swim && jumpDown && player.vy > 0 && player.floatTime < 90) {
+                    player.vy = 0.4;
+                    player.floatTime++;
+                    if (tick % 5 === 0) {
+                        particles.push({ x: player.x + Math.random() * player.w, y: player.y + player.h, vx: 0, vy: 0.5, life: 20, sparkle: true, r: 2 });
+                    }
+                }
+
+                // move X (wind pushes you too), then fix collisions
+                player.vx = inputVx + wind;
+                player.x += player.vx;
+                for (const p of platforms) {
+                    if (overlaps(player, p)) {
+                        if (player.vx > 0) player.x = p.x - player.w;
+                        if (player.vx < 0) player.x = p.x + p.w;
+                    }
+                }
+                player.vx = inputVx;
+
+                // move Y, then fix collisions
+                const wasOnGround = player.onGround;
+                const fallSpeed = player.vy;
+                const prevBottom = player.y + player.h;
+                player.y += player.vy;
+                player.onGround = false;
+                for (const p of platforms) {
+                    if (overlaps(player, p)) {
+                        if (player.vy > 0) { // falling onto platform
+                            player.y = p.y - player.h;
+                            player.onGround = true;
+                        } else if (player.vy < 0) { // bonking head
+                            player.y = p.y + p.h;
+                            if (p.box && !p.used) hitBox(p);
+                            else sounds.bonk();
+                        }
+                        player.vy = 0;
+                    }
+                }
+                if (player.y < 0) { player.y = 0; player.vy = Math.max(player.vy, 0); }
+                if (player.onGround) player.floatTime = 0;
+
+                // just landed?
+                if (player.onGround && !wasOnGround && fallSpeed > 3) {
+                    sounds.land();
+                    puff(player.x + player.w / 2, player.y + player.h, 8);
+                }
+
+                // keep player in the level
+                if (player.x < 0) player.x = 0;
+                if (player.x > level.width - player.w) player.x = level.width - player.w;
+
+                walkAnim();
+
+                // star power counting down
+                if (player.star > 0) {
+                    player.star--;
+                    if (tick % 4 === 0) {
+                        particles.push({ x: player.x + Math.random() * player.w, y: player.y + Math.random() * player.h,
+                            vx: 0, vy: -0.5, life: 20, sparkle: true, r: 2 });
+                    }
+                    if (player.star === 0) playSong(level.music);
+                }
+
+                // coins
+                for (const c of coins) {
+                    if (!c.taken && overlaps(player, { x: c.x - 8, y: c.y - 10, w: 16, h: 20 })) {
+                        c.taken = true;
+                        coinCount++;
+                        score += 200;
+                        sounds.coin();
+                        popup(c.x, c.y - 10, "+200");
+                    }
+                }
+
+                // enemies: land on top to stomp, touch from the side and you lose
+                for (const e of enemies) {
+                    if (e.dead || e.squashed || e.knocked || !overlaps(player, e)) continue;
+                    if (player.star > 0) {
+                        knockEnemy(e);
+                    } else if (e.kind !== "fireball" && fallSpeed > 0 && prevBottom <= e.y + 10) {
+                        e.squashed = 30;
+                        player.vy = P.swim ? -4 : -8;
+                        player.onGround = false;
+                        player.floatTime = 0;
+                        score += 100;
+                        sounds.stomp();
+                        popup(e.x + e.w / 2, e.y - 10, "+100");
+                        puff(e.x + e.w / 2, e.y + e.h, 6);
+                    } else {
+                        die(true);
+                        return;
+                    }
+                }
+
+                // reached the flagpole?
+                if (player.x + player.w >= level.pole.x + 4) {
+                    state = "won";
+                    winPhase = "slide";
+                    stateTimer = 0;
+                    const bonus = 100 * Math.max(1, Math.ceil((GROUND_Y - (player.y + player.h)) / 50));
+                    score += bonus;
+                    popup(level.pole.x, player.y - 10, "+" + bonus);
+                    player.x = level.pole.x - player.w + 4;
+                    player.vx = 0; player.vy = 0;
+                    player.facing = 1;
+                    player.onGround = false;
+                    player.star = 0;
+                    stopMusic();
+                    sounds.flagpole();
+                    return;
+                }
+
+                // fell in a pit or into lava? (star power doesn't save you from this!)
+                if (level.theme === "castle" ? player.y + player.h > LAVA_Y + 6 : player.y > H) die(false);
+            }
+
+            function updateDead() {
+                stateTimer++;
+                player.vy += 0.6;
+                player.y += player.vy;
+                if (stateTimer > 120) resetLevel();
+            }
+
+            function updateWon() {
+                stateTimer++;
+                const flagBottom = GROUND_Y - 30;
+                if (winPhase === "slide") {
+                    // slide down the pole together with the flag
+                    if (player.y + player.h < GROUND_Y) player.y = Math.min(player.y + 4, GROUND_Y - player.h);
+                    flagY = Math.min(flagY + 4, flagBottom);
+                    if (player.y + player.h >= GROUND_Y && flagY >= flagBottom && stateTimer > 30) {
+                        winPhase = "walk";
+                        player.onGround = true;
+                        sounds.win();
+                    }
+                } else if (winPhase === "walk") {
+                    // stroll into the castle
+                    player.vx = 2;
+                    player.x += player.vx;
+                    walkAnim();
+                    if (player.x > level.castle.x + level.castle.w / 2 - player.w / 2) {
+                        player.hidden = true;
+                        winPhase = "done";
+                    }
+                }
+            }
+
+            function walkAnim() {
+                if (player.onGround && player.vx !== 0) player.walkTime++;
+                else player.walkTime = 0;
+            }
+
+            function updateEnemies() {
+                for (const e of enemies) {
+                    if (e.dead) continue;
+                    if (e.knocked) { // flipped over, falling off the screen
+                        e.vy += 0.5;
+                        e.x += e.vx;
+                        e.y += e.vy;
+                        if (e.y > H + 50) e.dead = true;
+                        continue;
+                    }
+                    if (e.squashed) {
+                        if (--e.squashed === 0) e.dead = true;
+                        continue;
+                    }
+                    if (e.kind === "fireball") {
+                        // wait in the lava, then leap up and fall back down
+                        if (e.y >= e.baseY && (tick + e.delay) % 150 === 0) {
+                            e.vy = -12.5;
+                            puff(e.x + e.w / 2, LAVA_Y, 6, "ember");
+                        }
+                        e.vy += 0.35;
+                        e.y += e.vy;
+                        if (e.y > e.baseY) { e.y = e.baseY; e.vy = 0; }
+                        continue;
+                    }
+                    e.x += e.vx;
+                    if (e.x < e.min) { e.x = e.min; e.vx = 1; }
+                    if (e.x > e.max) { e.x = e.max; e.vx = -1; }
+                    if (e.kind === "fish" || e.kind === "crow") e.y = e.baseY + Math.sin(tick * 0.05 + e.min) * 18;
+                }
+            }
+
+            function updateStars() {
+                const P = physics();
+                for (const s of stars) {
+                    if (s.rise > 0) { s.y--; s.rise--; continue; }
+
+                    s.vy = Math.min(s.vy + P.gravity, P.maxFall);
+                    s.x += s.vx;
+                    for (const p of platforms) {
+                        if (overlaps(s, p)) {
+                            s.x = s.vx > 0 ? p.x - s.w : p.x + p.w;
+                            s.vx = -s.vx;
+                        }
+                    }
+                    s.y += s.vy;
+                    for (const p of platforms) {
+                        if (overlaps(s, p)) {
+                            if (s.vy > 0) { s.y = p.y - s.h; s.vy = P.swim ? -4 : -9; }
+                            else { s.y = p.y + p.h; s.vy = 0; }
+                        }
+                    }
+                    if (s.y > H) s.gone = true;
+
+                    if (state === "playing" && overlaps(player, s)) {
+                        s.gone = true;
+                        player.star = STAR_TIME;
+                        score += 1000;
+                        popup(s.x + s.w / 2, s.y - 10, "+1000");
+                        sounds.powerup();
+                        playSong(SONGS.star);
+                    }
+                }
+                stars = stars.filter(s => !s.gone);
+            }
+
+            // =====================================================
+            // DRAWING
+            // =====================================================
+            function drawPlayer() {
+                if (player.hidden) return;
+                const ch = CHARACTERS[selectedChar];
+                let pose = "stand";
+                if (!player.onGround) pose = "jump";
+                else if (player.vx !== 0) pose = Math.floor(player.walkTime / 6) % 2 ? "walk1" : "walk2";
+
+                // rainbow flashing with star power (flickers when it's about to run out)
+                let hue = null;
+                if (player.star > 0 && (player.star > 180 || Math.floor(tick / 6) % 2)) hue = (tick * 15) % 360;
+
+                drawCharacter(ch, pose, player.x, player.y, 2.5, player.facing, hue);
+            }
+
+            // --- enemies ---
+            function drawEnemy(e) {
+                if (e.y > H) return;
+                ctx.save();
+                if (e.squashed) {
+                    // flatten from the bottom
+                    ctx.translate(0, e.y + e.h);
+                    ctx.scale(1, 0.35);
+                    ctx.translate(0, -(e.y + e.h));
+                } else if (e.knocked) {
+                    // flip upside down
+                    ctx.translate(0, 2 * e.y + e.h);
+                    ctx.scale(1, -1);
+                }
+                if (e.kind === "fish") drawFish(e);
+                else if (e.kind === "crow") drawCrow(e);
+                else if (e.kind === "fireball") drawFireball(e);
+                else drawWalker(e);
+                ctx.restore();
+            }
+
+            function drawWalker(e) { // a grumpy mushroom
+                const { x, y, w, h } = e;
+                const step = Math.floor(tick / 10) % 2;
+                // feet
+                ctx.fillStyle = "#2b1a0e";
+                ctx.fillRect(x + (step ? 0 : 3), y + h - 6, 12, 6);
+                ctx.fillRect(x + w - 12 - (step ? 3 : 0), y + h - 6, 12, 6);
+                // body
+                ctx.fillStyle = "#f2d0a4";
+                ctx.fillRect(x + 8, y + 15, w - 16, 9);
+                // head
+                ctx.fillStyle = "#9c4a1a";
+                ctx.beginPath();
+                ctx.ellipse(x + w / 2, y + 10, w / 2, 10, 0, 0, Math.PI * 2);
+                ctx.fill();
+                // eyes
+                ctx.fillStyle = "#fff";
+                ctx.beginPath();
+                ctx.ellipse(x + 10, y + 11, 3, 4, 0, 0, Math.PI * 2);
+                ctx.ellipse(x + 20, y + 11, 3, 4, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = "#111";
+                ctx.fillRect(x + 10, y + 11, 2, 3);
+                ctx.fillRect(x + 18, y + 11, 2, 3);
+                // angry eyebrows
+                ctx.strokeStyle = "#111";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(x + 6, y + 4); ctx.lineTo(x + 13, y + 7);
+                ctx.moveTo(x + 24, y + 4); ctx.lineTo(x + 17, y + 7);
+                ctx.stroke();
+            }
+
+            function drawFish(e) {
+                const dir = e.vx >= 0 ? 1 : -1;
+                const tailWag = Math.sin(tick * 0.3) * 3;
+                ctx.save();
+                ctx.translate(e.x + e.w / 2, e.y + e.h / 2);
+                ctx.scale(dir, 1);
+                // tail
+                ctx.fillStyle = "#ff7a3d";
+                ctx.beginPath();
+                ctx.moveTo(-10, 0);
+                ctx.lineTo(-17, -10 + tailWag);
+                ctx.lineTo(-17, 10 + tailWag);
+                ctx.closePath();
+                ctx.fill();
+                // body
+                ctx.fillStyle = "#e63946";
+                ctx.beginPath();
+                ctx.ellipse(0, 0, 13, 11, 0, 0, Math.PI * 2);
+                ctx.fill();
+                // fin
+                ctx.fillStyle = "#ff9f6b";
+                ctx.beginPath();
+                ctx.moveTo(-4, -9); ctx.lineTo(4, -15); ctx.lineTo(6, -8);
+                ctx.closePath();
+                ctx.fill();
+                // belly
+                ctx.fillStyle = "#ffd6c2";
+                ctx.beginPath();
+                ctx.ellipse(2, 5, 8, 4, 0, 0, Math.PI * 2);
+                ctx.fill();
+                // eye
+                ctx.fillStyle = "#fff";
+                ctx.beginPath();
+                ctx.arc(6, -3, 4, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = "#111";
+                ctx.beginPath();
+                ctx.arc(7, -3, 2, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+
+            function drawCrow(e) {
+                const dir = e.vx >= 0 ? 1 : -1;
+                const flap = Math.sin(tick * 0.4) * 9;
+                ctx.save();
+                ctx.translate(e.x + e.w / 2, e.y + e.h / 2);
+                ctx.scale(dir, 1);
+                // wings
+                ctx.fillStyle = "#1b1b26";
+                ctx.beginPath();
+                ctx.moveTo(-6, -2); ctx.lineTo(-2, -4 - flap); ctx.lineTo(6, -2);
+                ctx.closePath();
+                ctx.fill();
+                // body
+                ctx.fillStyle = "#2b2b3a";
+                ctx.beginPath();
+                ctx.ellipse(0, 2, 13, 8, 0, 0, Math.PI * 2);
+                ctx.fill();
+                // tail
+                ctx.beginPath();
+                ctx.moveTo(-11, 0); ctx.lineTo(-18, -4); ctx.lineTo(-18, 6);
+                ctx.closePath();
+                ctx.fill();
+                // beak
+                ctx.fillStyle = "#ffb300";
+                ctx.beginPath();
+                ctx.moveTo(12, 0); ctx.lineTo(19, 3); ctx.lineTo(12, 5);
+                ctx.closePath();
+                ctx.fill();
+                // eye
+                ctx.fillStyle = "#ff3b3b";
+                ctx.fillRect(6, -2, 3, 3);
+                ctx.restore();
+            }
+
+            function drawFireball(e) {
+                const cx = e.x + e.w / 2, cy = e.y + e.h / 2;
+                const tailDir = e.vy < 0 ? 1 : -1; // flames trail behind the way it's moving
+                const flicker = Math.sin(tick * 0.5) * 3;
+                // glow
+                ctx.fillStyle = "rgba(255,120,0,0.25)";
+                ctx.beginPath();
+                ctx.arc(cx, cy, 20, 0, Math.PI * 2);
+                ctx.fill();
+                // tail
+                ctx.fillStyle = "#ff6a00";
+                ctx.beginPath();
+                ctx.moveTo(cx - 10, cy);
+                ctx.lineTo(cx + flicker, cy + tailDir * (24 + flicker));
+                ctx.lineTo(cx + 10, cy);
+                ctx.fill();
+                // ball
+                ctx.beginPath();
+                ctx.arc(cx, cy, 11, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = "#ffd23f";
+                ctx.beginPath();
+                ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+                ctx.fill();
+                // eyes
+                ctx.fillStyle = "#111";
+                ctx.fillRect(cx - 4, cy - 3, 2, 4);
+                ctx.fillRect(cx + 2, cy - 3, 2, 4);
+            }
+
+            function drawCoin(c) {
+                // squish the width over time so it looks like it's spinning
+                const spin = Math.abs(Math.cos(tick * 0.08 + c.x * 0.05));
+                const rx = 2 + 6 * spin;
+                ctx.fillStyle = "#ffcc00";
+                ctx.strokeStyle = "#b8860b";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.ellipse(c.x, c.y, rx, 10, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+                if (spin > 0.4) {
+                    ctx.fillStyle = "#fff6b0";
+                    ctx.fillRect(c.x - 1, c.y - 5, 2, 10);
+                }
+            }
+
+            function drawStar(s) {
+                const cx = s.x + s.w / 2, cy = s.y + s.h / 2;
+                ctx.fillStyle = Math.floor(tick / 5) % 2 ? "#ffd23f" : "#fff38a";
+                ctx.strokeStyle = "#c77800";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                for (let i = 0; i < 10; i++) {
+                    const r = i % 2 ? 5.5 : 13;
+                    const a = -Math.PI / 2 + i * Math.PI / 5;
+                    ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+                }
+                ctx.closePath();
+                ctx.fill();
+                ctx.stroke();
+                // eyes
+                ctx.fillStyle = "#111";
+                ctx.fillRect(cx - 4, cy - 3, 2, 5);
+                ctx.fillRect(cx + 2, cy - 3, 2, 5);
+            }
+
+            function drawMysteryBox(p) {
+                const lift = p.bump > 0 ? Math.sin((p.bump / 10) * Math.PI) * 8 : 0;
+                const x = p.x, y = p.y - lift;
+                ctx.lineWidth = 2;
+                if (p.used) {
+                    ctx.fillStyle = "#8a5a2b";
+                    ctx.strokeStyle = "#3d2410";
+                } else {
+                    ctx.fillStyle = Math.floor(tick / 20) % 3 === 0 ? "#ffcf3f" : "#f8b800";
+                    ctx.strokeStyle = "#7a4a00";
+                }
+                ctx.fillRect(x, y, p.w, p.h);
+                ctx.strokeRect(x + 1, y + 1, p.w - 2, p.h - 2);
+                // corner rivets
+                ctx.fillStyle = p.used ? "#3d2410" : "#7a4a00";
+                for (const [rx, ry] of [[4, 4], [p.w - 6, 4], [4, p.h - 6], [p.w - 6, p.h - 6]]) {
+                    ctx.fillRect(x + rx, y + ry, 2, 2);
+                }
+                if (!p.used) {
+                    ctx.font = "bold 20px monospace";
+                    ctx.textAlign = "center";
+                    ctx.fillStyle = "#7a4a00";
+                    ctx.fillText("?", x + p.w / 2 + 1, y + 22);
+                    ctx.fillStyle = "#fff";
+                    ctx.fillText("?", x + p.w / 2, y + 21);
+                    ctx.textAlign = "left";
+                }
+            }
+
+            function drawFlagpole() {
+                const pole = level.pole;
+                // base block
+                ctx.fillStyle = "#4a8f3a";
+                ctx.fillRect(pole.x - 8, GROUND_Y - 16, 20, 16);
+                // pole
+                ctx.fillStyle = "#cfd8dc";
+                ctx.fillRect(pole.x, pole.top, 4, GROUND_Y - 16 - pole.top);
+                // ball on top
+                ctx.fillStyle = "#4caf50";
+                ctx.beginPath();
+                ctx.arc(pole.x + 2, pole.top - 4, 6, 0, Math.PI * 2);
+                ctx.fill();
+                // flag (flaps harder in the storm)
+                const flap = level.theme === "storm" ? Math.sin(tick * 0.4) * 5 : 0;
+                ctx.fillStyle = "#fff";
+                ctx.beginPath();
+                ctx.moveTo(pole.x, flagY);
+                ctx.lineTo(pole.x - 34, flagY + 12 + flap);
+                ctx.lineTo(pole.x, flagY + 24);
+                ctx.closePath();
+                ctx.fill();
+                ctx.fillStyle = "#4caf50";
+                ctx.beginPath();
+                ctx.arc(pole.x - 10, flagY + 12, 5, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            const CASTLE_COLORS = {
+                overworld: ["#b5532a", "#5a2410"],
+                water:     ["#5b7f95", "#2c4a5c"],
+                castle:    ["#4a4550", "#221f26"],
+                storm:     ["#7a4a33", "#3e1c0c"],
+            };
+            function drawCastle() {
+                const { x, w } = level.castle;
+                const [fill, line] = CASTLE_COLORS[level.theme];
+                const top = GROUND_Y - 110;
+                ctx.fillStyle = fill;
+                ctx.fillRect(x, top + 40, w, 70);          // lower wall
+                ctx.fillRect(x + 25, top, w - 50, 40);     // tower
+                // battlements
+                for (let i = 0; i < 5; i++) ctx.fillRect(x + i * 24, top + 30, 14, 10);
+                for (let i = 0; i < 3; i++) ctx.fillRect(x + 25 + i * 24, top - 10, 12, 10);
+                // brick lines
+                ctx.strokeStyle = line;
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                for (let yy = top + 50; yy < GROUND_Y; yy += 12) { ctx.moveTo(x, yy); ctx.lineTo(x + w, yy); }
+                ctx.stroke();
+                // door + window
+                ctx.fillStyle = "#1a0d06";
+                ctx.beginPath();
+                ctx.moveTo(x + w / 2 - 15, GROUND_Y);
+                ctx.lineTo(x + w / 2 - 15, GROUND_Y - 28);
+                ctx.arc(x + w / 2, GROUND_Y - 28, 15, Math.PI, 0);
+                ctx.lineTo(x + w / 2 + 15, GROUND_Y);
+                ctx.fill();
+                ctx.fillRect(x + w / 2 - 6, top + 10, 12, 18);
+            }
+
+            // --- scenery ---
+            function drawCloud(x, y, s, color = "#fff") {
+                ctx.fillStyle = color;
+                ctx.beginPath();
+                ctx.arc(x, y, 18 * s, 0, Math.PI * 2);
+                ctx.arc(x + 22 * s, y - 10 * s, 22 * s, 0, Math.PI * 2);
+                ctx.arc(x + 46 * s, y, 18 * s, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillRect(x, y, 46 * s, 18 * s);
+            }
+
+            function drawBush(x) {
+                ctx.fillStyle = "#3e9b3a";
+                ctx.beginPath();
+                ctx.arc(x, GROUND_Y, 18, Math.PI, 0);
+                ctx.arc(x + 22, GROUND_Y, 24, Math.PI, 0);
+                ctx.arc(x + 46, GROUND_Y, 18, Math.PI, 0);
+                ctx.fill();
+            }
+
+            function drawSeaweed(x) {
+                ctx.strokeStyle = "#2e8b57";
+                ctx.lineWidth = 5;
+                ctx.lineCap = "round";
+                for (let i = 0; i < 3; i++) {
+                    const sx = x + i * 10;
+                    const height = 60 + ((x + i * 37) % 40);
+                    const sway = Math.sin(tick * 0.03 + x + i) * 10;
+                    ctx.beginPath();
+                    ctx.moveTo(sx, GROUND_Y);
+                    ctx.quadraticCurveTo(sx - sway, GROUND_Y - height / 2, sx + sway, GROUND_Y - height);
+                    ctx.stroke();
+                }
+                ctx.lineCap = "butt";
+            }
+
+            function drawTorch(x) {
+                const y = 220;
+                const flicker = Math.sin(tick * 0.3 + x) * 2;
+                ctx.fillStyle = "rgba(255,150,40,0.12)";
+                ctx.beginPath();
+                ctx.arc(x, y - 6, 34 + flicker, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = "#3a2a1a";
+                ctx.fillRect(x - 3, y, 6, 22);
+                ctx.fillStyle = "#ff7a1a";
+                ctx.beginPath();
+                ctx.ellipse(x, y - 6, 6, 10 + flicker, 0, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = "#ffd23f";
+                ctx.beginPath();
+                ctx.ellipse(x, y - 3, 3, 6 + flicker / 2, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            function drawPuddle(x) {
+                ctx.fillStyle = "#5d7fa3";
+                ctx.beginPath();
+                ctx.ellipse(x + 30, GROUND_Y + 2, 30, 4, 0, 0, Math.PI * 2);
+                ctx.fill();
+                // raindrop ripples
+                const t = (tick + x) % 40;
+                ctx.strokeStyle = `rgba(220,235,255,${1 - t / 40})`;
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.ellipse(x + 15 + (x % 30), GROUND_Y + 2, t / 3, t / 12, 0, 0, Math.PI * 2);
+                ctx.stroke();
+            }
+
+            function drawDecor(x) {
+                if (level.theme === "water") drawSeaweed(x);
+                else if (level.theme === "castle") drawTorch(x);
+                else if (level.theme === "overworld") drawBush(x);
+            }
+
+            function drawLava() {
+                ctx.fillStyle = "#e84a00";
+                ctx.beginPath();
+                ctx.moveTo(cameraX, H);
+                for (let x = cameraX; x <= cameraX + W + 20; x += 20) {
+                    ctx.lineTo(x, LAVA_Y + Math.sin(x * 0.05 + tick * 0.08) * 4);
+                }
+                ctx.lineTo(cameraX + W + 20, H);
+                ctx.fill();
+                // bright surface
+                ctx.strokeStyle = "#ffb300";
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                for (let x = cameraX; x <= cameraX + W + 20; x += 20) {
+                    ctx.lineTo(x, LAVA_Y + 2 + Math.sin(x * 0.05 + tick * 0.08) * 4);
+                }
+                ctx.stroke();
+            }
+
+            const GROUND_COLORS = {
+                overworld: { dirt: "#c8743a", line: "#8f4f22", grass: "#4caf50", grassDark: "#2e7d32" },
+                storm:     { dirt: "#7a5234", line: "#4d321f", grass: "#3f7a3a", grassDark: "#24502a" },
+            };
+            function drawGround(p) {
+                const start = Math.max(p.x, Math.floor(cameraX / 25) * 25);
+                const end = Math.min(p.x + p.w, cameraX + W + 25);
+
+                if (level.theme === "water") {
+                    ctx.fillStyle = "#d9c27e";
+                    ctx.fillRect(p.x, p.y, p.w, p.h);
+                    // sandy speckles
+                    ctx.fillStyle = "#b89f5c";
+                    for (let x = start; x < end; x += 25) {
+                        ctx.fillRect(x + 6, p.y + 20, 3, 3);
+                        ctx.fillRect(x + 16, p.y + 34, 3, 3);
+                    }
+                    ctx.fillStyle = "#f0dda0";
+                    ctx.fillRect(p.x, p.y, p.w, 6);
+                    return;
+                }
+
+                if (level.theme === "castle") {
+                    // big grey stone blocks
+                    ctx.fillStyle = "#5a5560";
+                    ctx.fillRect(p.x, p.y, p.w, p.h);
+                    ctx.strokeStyle = "#2f2b33";
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    for (let x = start; x < end; x += 25) {
+                        ctx.moveTo(x, p.y); ctx.lineTo(x, p.y + 25);
+                        ctx.moveTo(x + 12, p.y + 25); ctx.lineTo(x + 12, p.y + p.h);
+                    }
+                    ctx.moveTo(p.x, p.y + 25); ctx.lineTo(p.x + p.w, p.y + 25);
+                    ctx.stroke();
+                    ctx.fillStyle = "rgba(255,255,255,0.15)";
+                    ctx.fillRect(p.x, p.y, p.w, 3);
+                    return;
+                }
+
+                const c = GROUND_COLORS[level.theme];
+                ctx.fillStyle = c.dirt;
+                ctx.fillRect(p.x, p.y, p.w, p.h);
+                // tile lines
+                ctx.strokeStyle = c.line;
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                for (let x = start; x < end; x += 25) {
+                    ctx.moveTo(x, p.y + 12); ctx.lineTo(x, p.y + p.h);
+                }
+                ctx.moveTo(start, p.y + 30); ctx.lineTo(end, p.y + 30);
+                ctx.stroke();
+                // grass
+                ctx.fillStyle = c.grass;
+                ctx.fillRect(p.x, p.y, p.w, 10);
+                ctx.fillStyle = c.grassDark;
+                ctx.fillRect(p.x, p.y + 8, p.w, 4);
+            }
+
+            const BRICK_COLORS = {
+                overworld: ["#b5532a", "#5a2410"],
+                storm:     ["#8a4426", "#3e1c0c"],
+                castle:    ["#6b6570", "#2f2b33"],
+            };
+            function drawBricks(p) {
+                const [fill, line] = BRICK_COLORS[level.theme];
+                ctx.fillStyle = fill;
+                ctx.fillRect(p.x, p.y, p.w, p.h);
+                ctx.strokeStyle = line;
+                ctx.lineWidth = 2;
+                ctx.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2);
+                ctx.beginPath();
+                ctx.moveTo(p.x, p.y + p.h / 2); ctx.lineTo(p.x + p.w, p.y + p.h / 2);
+                for (let x = p.x + 20; x < p.x + p.w; x += 20) {
+                    ctx.moveTo(x, p.y); ctx.lineTo(x, p.y + p.h / 2);
+                    ctx.moveTo(x - 10, p.y + p.h / 2); ctx.lineTo(x - 10, p.y + p.h);
+                }
+                ctx.stroke();
+                // highlight on top edge
+                ctx.fillStyle = "rgba(255,255,255,0.25)";
+                ctx.fillRect(p.x + 2, p.y + 2, p.w - 4, 2);
+            }
+
+            function drawRock(p) {
+                ctx.fillStyle = "#4f7d8c";
+                ctx.fillRect(p.x, p.y, p.w, p.h);
+                ctx.strokeStyle = "#2c4a5c";
+                ctx.lineWidth = 2;
+                ctx.strokeRect(p.x + 1, p.y + 1, p.w - 2, p.h - 2);
+                ctx.fillStyle = "rgba(255,255,255,0.2)";
+                ctx.fillRect(p.x + 2, p.y + 2, p.w - 4, 3);
+                // little pink coral bumps
+                ctx.fillStyle = "#ff7fa8";
+                for (let x = p.x + 8; x < p.x + p.w - 4; x += 26) {
+                    ctx.beginPath();
+                    ctx.arc(x, p.y, 4, Math.PI, 0);
+                    ctx.fill();
+                }
+            }
+
+            const wrap = (x, span, offset) => ((x % span) + span) % span - offset;
+
+            function drawBackground() {
+                if (level.theme === "water") {
+                    const sea = ctx.createLinearGradient(0, 0, 0, H);
+                    sea.addColorStop(0, "#2a86d1");
+                    sea.addColorStop(1, "#0b3466");
+                    ctx.fillStyle = sea;
+                    ctx.fillRect(0, 0, W, H);
+
+                    // light rays from the surface
+                    ctx.fillStyle = "rgba(255,255,255,0.06)";
+                    for (let i = 0; i < 6; i++) {
+                        const x = wrap(i * 180 - cameraX * 0.2, 1080, 140);
+                        const sway = Math.sin(tick * 0.01 + i) * 20;
+                        ctx.beginPath();
+                        ctx.moveTo(x, 0);
+                        ctx.lineTo(x + 40, 0);
+                        ctx.lineTo(x + 140 + sway, H);
+                        ctx.lineTo(x + 80 + sway, H);
+                        ctx.fill();
+                    }
+
+                    // distant rocks
+                    ctx.fillStyle = "#174f80";
+                    for (const h of hills) {
+                        ctx.beginPath();
+                        ctx.arc(wrap(h.x - cameraX * 0.4, 2400, 200), GROUND_Y, h.r, Math.PI, 0);
+                        ctx.fill();
+                    }
+                    return;
+                }
+
+                if (level.theme === "castle") {
+                    const g = ctx.createLinearGradient(0, 0, 0, H);
+                    g.addColorStop(0, "#140b14");
+                    g.addColorStop(1, "#3a1414");
+                    ctx.fillStyle = g;
+                    ctx.fillRect(0, 0, W, H);
+
+                    // stone wall pattern, scrolling slower than the floor
+                    ctx.strokeStyle = "rgba(255,255,255,0.05)";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    const off = (cameraX * 0.5) % 40;
+                    for (let y = 0; y < GROUND_Y; y += 20) {
+                        ctx.moveTo(0, y); ctx.lineTo(W, y);
+                        for (let x = -off + ((y / 20) % 2) * 20; x < W; x += 40) {
+                            ctx.moveTo(x, y); ctx.lineTo(x, y + 20);
+                        }
+                    }
+                    ctx.stroke();
+
+                    // arched windows glowing red
+                    for (let i = 0; i < 4; i++) {
+                        const x = wrap(i * 300 + 100 - cameraX * 0.5, 1200, 100);
+                        ctx.fillStyle = "#4a0f0f";
+                        ctx.beginPath();
+                        ctx.moveTo(x, 160);
+                        ctx.lineTo(x, 110);
+                        ctx.arc(x + 20, 110, 20, Math.PI, 0);
+                        ctx.lineTo(x + 40, 160);
+                        ctx.fill();
+                    }
+
+                    // heat glow from the lava
+                    const glow = ctx.createLinearGradient(0, 280, 0, H);
+                    glow.addColorStop(0, "rgba(255,80,0,0)");
+                    glow.addColorStop(1, "rgba(255,80,0,0.35)");
+                    ctx.fillStyle = glow;
+                    ctx.fillRect(0, 280, W, H - 280);
+                    return;
+                }
+
+                const storm = level.theme === "storm";
+                const sky = ctx.createLinearGradient(0, 0, 0, H);
+                sky.addColorStop(0, storm ? "#232a36" : "#5ab8ff");
+                sky.addColorStop(1, storm ? "#56606e" : "#bfe6ff");
+                ctx.fillStyle = sky;
+                ctx.fillRect(0, 0, W, H);
+
+                if (!storm) {
+                    // sun (fixed in the sky)
+                    ctx.fillStyle = "#fff3a0";
+                    ctx.beginPath();
+                    ctx.arc(680, 90, 34, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+
+                // clouds — slowest layer (storm clouds are big, dark and drift)
+                for (const c of clouds) {
+                    if (storm) {
+                        drawCloud(wrap(c.x - cameraX * 0.15 - tick * 0.4, 1800, 150), c.y, c.s * 1.8, "#3b4250");
+                    } else {
+                        drawCloud(wrap(c.x - cameraX * 0.15, 1800, 100), c.y + 20, c.s);
+                    }
+                }
+
+                // hills — middle layer
+                for (const h of hills) {
+                    const x = wrap(h.x - cameraX * 0.4, 2400, 200);
+                    ctx.fillStyle = storm ? "#34503a" : "#7cc56b";
+                    ctx.beginPath();
+                    ctx.arc(x, GROUND_Y, h.r, Math.PI, 0);
+                    ctx.fill();
+                    if (!storm) {
+                        ctx.fillStyle = "#5fa94f";
+                        ctx.beginPath();
+                        ctx.arc(x - h.r * 0.3, GROUND_Y - h.r * 0.45, 5, 0, Math.PI * 2);
+                        ctx.arc(x + h.r * 0.25, GROUND_Y - h.r * 0.6, 5, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+            }
+
+            // rain and lightning, drawn on top of everything in the level
+            function drawWeather() {
+                if (level.theme !== "storm") return;
+                ctx.strokeStyle = "rgba(190,205,230,0.55)";
+                ctx.lineWidth = 1.5;
+                ctx.beginPath();
+                const slant = (wind * 3 - 1.5) * 1.5;
+                for (const d of rain) {
+                    ctx.moveTo(d.x, d.y);
+                    ctx.lineTo(d.x + slant, d.y + d.len);
+                }
+                ctx.stroke();
+
+                if (lightning > 0) {
+                    if (lightning > 7) {
+                        ctx.strokeStyle = "#fffbe0";
+                        ctx.lineWidth = 3;
+                        ctx.beginPath();
+                        bolt.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+                        ctx.stroke();
+                    }
+                    ctx.fillStyle = `rgba(255,255,255,${(lightning / 14) * 0.55})`;
+                    ctx.fillRect(0, 0, W, H);
+                }
+            }
+
+            function outlinedText(text, x, y) {
+                ctx.strokeText(text, x, y);
+                ctx.fillText(text, x, y);
+            }
+
+            function drawHud() {
+                ctx.font = "bold 18px monospace";
+                ctx.textAlign = "left";
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = "rgba(0,0,0,0.6)";
+                ctx.fillStyle = "#fff";
+                outlinedText("SCORE " + String(score).padStart(6, "0"), 16, 30);
+
+                drawCoin({ x: 250, y: 24 });
+                ctx.fillStyle = "#fff";
+                outlinedText("× " + coinCount, 264, 30);
+
+                outlinedText("WORLD " + level.name, 360, 30);
+
+                if (player.star > 0) {
+                    ctx.fillStyle = "#ffd23f";
+                    outlinedText("★ " + Math.ceil(player.star / 60) + "s", 520, 30);
+                }
+                if (wind < -0.4) {
+                    ctx.fillStyle = "#cfe3ff";
+                    outlinedText("WIND ←", 640, 30);
+                }
+
+                // controls hint
+                ctx.font = "13px monospace";
+                ctx.fillStyle = "rgba(0,0,0,0.45)";
+                ctx.fillRect(10, H - 32, 470, 22);
+                ctx.fillStyle = "#fff";
+                const ch = CHARACTERS[selectedChar];
+                let move = "←/→ move  Space jump";
+                if (level.theme === "water") move = "←/→ swim  tap Space to paddle";
+                else if (ch.float) move = "←/→ move  Space jump (hold to float)";
+                ctx.fillText(`${move}  M sound  Esc menu`, 18, H - 16);
+
+                // level title card
+                if (bannerTimer > 0) {
+                    ctx.globalAlpha = Math.min(1, bannerTimer / 30);
+                    ctx.textAlign = "center";
+                    ctx.font = "bold 36px monospace";
+                    ctx.fillStyle = "#fff";
+                    outlinedText("WORLD " + level.name, W / 2, 170);
+                    ctx.font = "bold 18px monospace";
+                    outlinedText(level.subtitle, W / 2, 200);
+                    ctx.globalAlpha = 1;
+                }
+
+                if (state === "won" && winPhase !== "slide") {
+                    const last = levelIndex === LEVELS.length - 1;
+                    ctx.textAlign = "center";
+                    ctx.fillStyle = "rgba(0,0,0,0.5)";
+                    ctx.fillRect(0, 150, W, 100);
+                    ctx.fillStyle = "#ffd23f";
+                    ctx.font = "bold 40px monospace";
+                    ctx.fillText(last ? "YOU BEAT THE GAME!" : "COURSE CLEAR!", W / 2, 200);
+                    ctx.fillStyle = "#fff";
+                    ctx.font = "16px monospace";
+                    const next = last ? "Press Enter for the menu" : `Press Enter for World ${LEVELS[levelIndex + 1].name}`;
+                    ctx.fillText(`Coins ${coinCount}  ·  ${next}`, W / 2, 230);
+                }
+                ctx.textAlign = "left";
+            }
+
+            // --- home page ---
+            function drawMenu() {
+                if (menuMode === "kart") {
+                    Kart.drawPreview(selectedKart);
+                } else {
+                    drawBackground();
+                    drawWeather();
+                }
+                ctx.fillStyle = "rgba(0,0,0,0.4)";
+                ctx.fillRect(0, 0, W, H);
+                menuButtons = [];
+
+                ctx.textAlign = "center";
+                ctx.lineWidth = 6;
+                ctx.strokeStyle = "#7a1d00";
+                ctx.fillStyle = "#ffd23f";
+                ctx.font = "bold 46px monospace";
+                outlinedText("SUPER PIXEL BROS", W / 2, 68);
+
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = "rgba(0,0,0,0.6)";
+                ctx.fillStyle = "#fff";
+                ctx.font = "bold 15px monospace";
+                outlinedText("CHOOSE YOUR CHARACTER", W / 2, 110);
+
+                CHARACTERS.forEach((ch, i) => {
+                    const x = 70 + i * 170, y = 122, w = 150, h = 165;
+                    const selected = i === selectedChar;
+                    ctx.fillStyle = selected ? "rgba(255,210,63,0.25)" : "rgba(0,0,0,0.45)";
+                    ctx.fillRect(x, y, w, h);
+                    ctx.strokeStyle = selected ? "#ffd23f" : "rgba(255,255,255,0.25)";
+                    ctx.lineWidth = selected ? 3 : 1;
+                    ctx.strokeRect(x, y, w, h);
+
+                    const pose = selected ? (Math.floor(tick / 8) % 2 ? "walk1" : "walk2") : "stand";
+                    const bounce = selected ? Math.abs(Math.sin(tick * 0.1)) * 6 : 0;
+                    drawCharacter(ch, pose, x + w / 2 - 24, y + 14 - bounce, 4, 1, null);
+
+                    ctx.fillStyle = selected ? "#ffd23f" : "#fff";
+                    ctx.font = "bold 18px monospace";
+                    ctx.fillText(ch.name.toUpperCase(), x + w / 2, y + 102);
+                    ctx.fillStyle = "#ddd";
+                    ctx.font = "12px monospace";
+                    ctx.fillText(ch.desc, x + w / 2, y + 121);
+
+                    // speed / jump stat bars
+                    ["SPD", "JMP"].forEach((label, row) => {
+                        const sy = y + 135 + row * 14;
+                        ctx.textAlign = "left";
+                        ctx.fillStyle = "#bbb";
+                        ctx.font = "11px monospace";
+                        ctx.fillText(label, x + 22, sy + 9);
+                        for (let b = 0; b < 5; b++) {
+                            ctx.fillStyle = b < ch.stats[row] ? "#ffd23f" : "rgba(255,255,255,0.2)";
+                            ctx.fillRect(x + 52 + b * 15, sy, 12, 9);
+                        }
+                        ctx.textAlign = "center";
+                    });
+
+                    menuButtons.push({ x, y, w, h, action: () => { selectedChar = i; sounds.select(); } });
+                });
+
+                // mode tabs: platformer adventure or kart racing
+                const kart = menuMode === "kart";
+                [["ADVENTURE", false], ["KART RACING", true]].forEach(([label, isKart], i) => {
+                    const x = W / 2 - 170 + i * 175, y = 296, w = 165, h = 24;
+                    const on = kart === isKart;
+                    ctx.fillStyle = on ? "#ffd23f" : "rgba(0,0,0,0.5)";
+                    ctx.fillRect(x, y, w, h);
+                    ctx.strokeStyle = on ? "#ffd23f" : "rgba(255,255,255,0.3)";
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(x, y, w, h);
+                    ctx.fillStyle = on ? "#3a2400" : "#fff";
+                    ctx.font = "bold 14px monospace";
+                    ctx.fillText(label, x + w / 2, y + 17);
+                    menuButtons.push({ x, y, w, h, action: () => { if (!on) switchMenuMode(); } });
+                });
+
+                const entries = kart
+                    ? Kart.entries
+                    : LEVELS.map(lv => ({ title: "WORLD " + lv.name, subtitle: lv.subtitle }));
+                entries.forEach((entry, i) => {
+                    const x = 52 + i * 177, y = 328, w = 165, h = 52;
+                    const selected = i === (kart ? selectedKart : selectedLevel);
+                    ctx.fillStyle = selected ? "rgba(255,210,63,0.25)" : "rgba(0,0,0,0.45)";
+                    ctx.fillRect(x, y, w, h);
+                    ctx.strokeStyle = selected ? "#ffd23f" : "rgba(255,255,255,0.25)";
+                    ctx.lineWidth = selected ? 3 : 1;
+                    ctx.strokeRect(x, y, w, h);
+                    ctx.fillStyle = selected ? "#ffd23f" : "#fff";
+                    ctx.font = "bold 16px monospace";
+                    ctx.fillText(entry.title, x + w / 2, y + 22);
+                    ctx.fillStyle = "#ddd";
+                    ctx.font = "12px monospace";
+                    ctx.fillText(entry.subtitle, x + w / 2, y + 40);
+
+                    // clicking a level or track starts it right away
+                    menuButtons.push({ x, y, w, h, action: () => {
+                        if (kart) { selectedKart = i; startKart(); }
+                        else { selectedLevel = i; level = LEVELS[i]; startGame(); }
+                    }});
+                });
+
+                ctx.fillStyle = "#fff";
+                ctx.font = "bold 14px monospace";
+                ctx.lineWidth = 4;
+                ctx.strokeStyle = "rgba(0,0,0,0.6)";
+                outlinedText(`←/→ character   ↑/↓ ${kart ? "track" : "level"}   Tab mode   Enter start`, W / 2, 408);
+                ctx.fillStyle = "#ccc";
+                ctx.font = "12px monospace";
+                ctx.fillText("or click a character, then click a level or track  ·  M toggles sound", W / 2, 430);
+                ctx.textAlign = "left";
+            }
+
+            function draw() {
+                if (state === "menu") { drawMenu(); return; }
+                if (state === "kart") { Kart.draw(); return; }
+
+                drawBackground();
+
+                ctx.save();
+                ctx.translate(-cameraX, 0);
+
+                for (const x of level.decor) drawDecor(x);
+
+                drawCastle();
+                drawFlagpole();
+
+                if (level.theme === "castle") drawLava();
+
+                for (const s of stars) drawStar(s); // drawn before boxes so it rises out from behind
+                for (const p of platforms) {
+                    if (p.box) drawMysteryBox(p);
+                    else if (p.ground) drawGround(p);
+                    else if (level.theme === "water") drawRock(p);
+                    else drawBricks(p);
+                }
+                if (level.theme === "storm") for (const x of level.decor) drawPuddle(x);
+
+                for (const c of coins) if (!c.taken) drawCoin(c);
+                for (const c of popCoins) drawCoin(c);
+                for (const e of enemies) if (!e.dead) drawEnemy(e);
+
+                // dust, bubbles, embers and sparkles
+                for (const pt of particles) {
+                    const alpha = Math.min(1, pt.life / 30);
+                    ctx.beginPath();
+                    ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+                    if (pt.bubble) {
+                        ctx.strokeStyle = `rgba(255,255,255,${alpha * 0.8})`;
+                        ctx.lineWidth = 1.5;
+                        ctx.stroke();
+                    } else {
+                        ctx.fillStyle = pt.sparkle ? `rgba(255,240,120,${alpha})`
+                            : pt.ember ? `rgba(255,140,30,${alpha})`
+                            : `rgba(240,230,210,${alpha})`;
+                        ctx.fill();
+                    }
+                }
+
+                drawPlayer();
+
+                // score popups
+                ctx.font = "bold 14px monospace";
+                ctx.textAlign = "center";
+                for (const f of floaters) {
+                    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, f.life / 20)})`;
+                    ctx.fillText(f.text, f.x, f.y);
+                }
+                ctx.textAlign = "left";
+
+                ctx.restore();
+
+                drawWeather();
+                drawHud();
+            }
+
+            // =====================================================
+            // MAIN LOOP
+            // =====================================================
+            goToMenu();
+
+            function loop() {
+                update();
+                draw();
+                requestAnimationFrame(loop);
+            }
+            loop();
+        </script>
+        <script src="kart.js"></script>
+    </body>
+</html>
