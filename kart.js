@@ -564,8 +564,9 @@ const Kart = (() => {
         } else {
             if (keys["ArrowLeft"] || keys["KeyA"]) { p.offset -= dx; steer = -1; }
             if (keys["ArrowRight"] || keys["KeyD"]) { p.offset += dx; steer = 1; }
-            const gas = keys["ArrowUp"] || keys["KeyW"] || keys["KeyX"];
             const brake = keys["ArrowDown"] || keys["KeyS"] || keys["KeyZ"];
+            // on phones the gas is always on, so you only need to steer
+            const gas = keys["ArrowUp"] || keys["KeyW"] || keys["KeyX"] || (touchMode && !brake);
             if (gas) p.speed += ACCEL * DT;
             else if (brake) p.speed += BRAKING * DT;
             else p.speed += DECEL * DT;
@@ -1150,7 +1151,9 @@ const Kart = (() => {
             ctx.font = "13px monospace";
             ctx.lineWidth = 3;
             ctx.fillStyle = "#fff";
-            outlinedText("↑ gas   ↓ brake   ←/→ steer   Space use item   Esc menu", W / 2, H - 60);
+            outlinedText(touchMode
+                ? "Steer with ◀ ▶  ·  gas is automatic  ·  BRAKE and ITEM on the right"
+                : "↑ gas   ↓ brake   ←/→ steer   Space use item   Esc menu", W / 2, H - 60);
         }
         if (banner) {
             ctx.font = "bold 48px monospace";
@@ -1206,7 +1209,8 @@ const Kart = (() => {
         ctx.font = "15px monospace";
         ctx.fillStyle = "#fff";
         const last = cup.race + 1 >= cup.tracks.length;
-        ctx.fillText(last ? "Press Enter for the trophy ceremony" : "Press Enter for the next race", W / 2, H - 22);
+        const press = touchMode ? "Tap" : "Press Enter";
+        ctx.fillText(last ? `${press} for the trophy ceremony` : `${press} for the next race`, W / 2, H - 22);
         ctx.textAlign = "left";
     }
 
@@ -1284,7 +1288,7 @@ const Kart = (() => {
         ctx.textAlign = "center";
         ctx.fillStyle = "#fff";
         ctx.font = "15px monospace";
-        ctx.fillText("Press Enter to return to the menu", W / 2, H - 22);
+        ctx.fillText(`${touchMode ? "Tap" : "Press Enter"} to return to the menu`, W / 2, H - 22);
         ctx.textAlign = "left";
     }
 

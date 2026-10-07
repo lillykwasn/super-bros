@@ -1,10 +1,72 @@
 <!doctype html>
 <html>
     <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
         <title>Super Pixel Bros</title>
+        <style>
+            html, body { margin: 0; height: 100%; background: #222; overflow: hidden; }
+            body {
+                display: grid; place-items: center;
+                touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+            }
+            /* the game is drawn at 800x450 and scaled to fit the screen */
+            canvas {
+                width: min(100vw, calc(100vh * 16 / 9));
+                width: min(100vw, calc(100dvh * 16 / 9));
+                aspect-ratio: 16 / 9;
+                image-rendering: pixelated;
+                cursor: pointer;
+            }
+            body:not(.touch) canvas { max-width: 800px; }
+
+            /* on-screen buttons, only shown on touch screens */
+            #touch { position: fixed; inset: 0; pointer-events: none; }
+            #touch[data-mode="none"] { display: none; }
+            #touch[data-mode="kart"] .adv-only, #touch[data-mode="adventure"] .kart-only { display: none; }
+            #touch button {
+                pointer-events: auto; touch-action: none; -webkit-tap-highlight-color: transparent;
+                width: 74px; height: 74px; border-radius: 50%;
+                border: 3px solid rgba(255,255,255,0.6); background: rgba(0,0,0,0.35);
+                color: #fff; font: bold 24px monospace;
+            }
+            #touch button.down { background: rgba(255,210,63,0.6); }
+            #touch button.big { width: 92px; height: 92px; font-size: 18px; }
+            #touch button.label { font-size: 13px; }
+            #touch button.mini { width: 42px; height: 42px; font-size: 18px; border-width: 2px; }
+            .cluster { position: absolute; bottom: max(14px, env(safe-area-inset-bottom)); display: flex; gap: 14px; align-items: flex-end; }
+            .cluster.left { left: max(14px, env(safe-area-inset-left)); }
+            .cluster.right { right: max(14px, env(safe-area-inset-right)); }
+            .cluster.top { bottom: auto; top: 70px; right: max(14px, env(safe-area-inset-right)); gap: 10px; }
+
+            #rotate {
+                display: none; position: fixed; inset: 0; z-index: 10; padding: 24px;
+                background: #111; color: #fff; font: bold 20px monospace;
+                align-items: center; justify-content: center; text-align: center;
+            }
+            @media (orientation: portrait) { body.touch #rotate { display: flex; } }
+        </style>
     </head>
-    <body style="margin:0; background:#222; display:grid; place-items:center; height:100vh">
-        <canvas id="game" width="800" height="450" style="image-rendering:pixelated; cursor:pointer"></canvas>
+    <body>
+        <canvas id="game" width="800" height="450"></canvas>
+        <div id="touch" data-mode="none">
+            <div class="cluster left">
+                <button data-key="ArrowLeft">◀</button>
+                <button data-key="ArrowRight">▶</button>
+            </div>
+            <div class="cluster right">
+                <button data-key="ArrowDown" class="kart-only label">BRAKE</button>
+                <button data-key="Space" class="kart-only big">ITEM</button>
+                <button data-key="Space" class="adv-only big">JUMP</button>
+            </div>
+            <div class="cluster top">
+                <button data-key="KeyM" data-tap class="mini">♪</button>
+                <button data-key="Escape" data-tap class="mini">☰</button>
+            </div>
+        </div>
+        <div id="rotate">Turn your phone sideways to play ↻</div>
         <script>
             const canvas = document.getElementById("game");
             const ctx = canvas.getContext("2d");
@@ -752,9 +814,56 @@
             });
             addEventListener("keyup", e => keys[e.code] = false);
 
+            // =====================================================
+            // TOUCH SCREENS
+            // On-screen buttons pretend to be keyboard keys, so the rest of
+            // the game doesn't need to know whether you're on a phone.
+            // =====================================================
+            let touchMode = false;
+            const touchPad = document.getElementById("touch");
+            const sendKey = (type, code) => dispatchEvent(new KeyboardEvent(type, { code }));
+
+            function enableTouch() {
+                touchMode = true;
+                document.body.classList.add("touch");
+            }
+            if (navigator.maxTouchPoints > 0 || matchMedia("(pointer: coarse)").matches) enableTouch();
+            addEventListener("touchstart", () => { if (!touchMode) enableTouch(); }, { passive: true });
+            addEventListener("touchend", initAudio); // phones only allow sound after a tap
+
+            for (const btn of touchPad.querySelectorAll("button")) {
+                const code = btn.dataset.key;
+                btn.addEventListener("pointerdown", e => {
+                    e.preventDefault();
+                    sendKey("keydown", code);
+                    if ("tap" in btn.dataset) sendKey("keyup", code); // one-shot buttons (menu, sound)
+                    else btn.classList.add("down");
+                });
+                const release = () => {
+                    if (!btn.classList.contains("down")) return;
+                    btn.classList.remove("down");
+                    sendKey("keyup", code);
+                };
+                btn.addEventListener("pointerup", release);
+                btn.addEventListener("pointercancel", release);
+                btn.addEventListener("pointerleave", release);
+                btn.addEventListener("contextmenu", e => e.preventDefault());
+            }
+
+            // show the right buttons for what's on screen
+            function updateTouchControls() {
+                const mode = !touchMode || state === "menu" ? "none" : state === "kart" ? "kart" : "adventure";
+                if (touchPad.dataset.mode !== mode) touchPad.dataset.mode = mode;
+            }
+
             canvas.addEventListener("click", e => {
                 initAudio();
-                if (state !== "menu") return;
+                // tapping the game works like Enter ("Press Enter to continue" screens)
+                if (state !== "menu") {
+                    sendKey("keydown", "Enter");
+                    sendKey("keyup", "Enter");
+                    return;
+                }
                 const r = canvas.getBoundingClientRect();
                 const mx = (e.clientX - r.left) * W / r.width;
                 const my = (e.clientY - r.top) * H / r.height;
@@ -1779,16 +1888,18 @@
                     outlinedText("WIND ←", 640, 30);
                 }
 
-                // controls hint
-                ctx.font = "13px monospace";
-                ctx.fillStyle = "rgba(0,0,0,0.45)";
-                ctx.fillRect(10, H - 32, 470, 22);
-                ctx.fillStyle = "#fff";
-                const ch = CHARACTERS[selectedChar];
-                let move = "←/→ move  Space jump";
-                if (level.theme === "water") move = "←/→ swim  tap Space to paddle";
-                else if (ch.float) move = "←/→ move  Space jump (hold to float)";
-                ctx.fillText(`${move}  M sound  Esc menu`, 18, H - 16);
+                // keyboard controls hint (phones have on-screen buttons instead)
+                if (!touchMode) {
+                    ctx.font = "13px monospace";
+                    ctx.fillStyle = "rgba(0,0,0,0.45)";
+                    ctx.fillRect(10, H - 32, 470, 22);
+                    ctx.fillStyle = "#fff";
+                    const ch = CHARACTERS[selectedChar];
+                    let move = "←/→ move  Space jump";
+                    if (level.theme === "water") move = "←/→ swim  tap Space to paddle";
+                    else if (ch.float) move = "←/→ move  Space jump (hold to float)";
+                    ctx.fillText(`${move}  M sound  Esc menu`, 18, H - 16);
+                }
 
                 // level title card
                 if (bannerTimer > 0) {
@@ -1812,7 +1923,8 @@
                     ctx.fillText(last ? "YOU BEAT THE GAME!" : "COURSE CLEAR!", W / 2, 200);
                     ctx.fillStyle = "#fff";
                     ctx.font = "16px monospace";
-                    const next = last ? "Press Enter for the menu" : `Press Enter for World ${LEVELS[levelIndex + 1].name}`;
+                    const press = touchMode ? "Tap" : "Press Enter";
+                    const next = last ? `${press} for the menu` : `${press} for World ${LEVELS[levelIndex + 1].name}`;
                     ctx.fillText(`Coins ${coinCount}  ·  ${next}`, W / 2, 230);
                 }
                 ctx.textAlign = "left";
@@ -1925,10 +2037,17 @@
                 ctx.font = "bold 14px monospace";
                 ctx.lineWidth = 4;
                 ctx.strokeStyle = "rgba(0,0,0,0.6)";
-                outlinedText(`←/→ character   ↑/↓ ${kart ? "track" : "level"}   Tab mode   Enter start`, W / 2, 408);
-                ctx.fillStyle = "#ccc";
-                ctx.font = "12px monospace";
-                ctx.fillText("or click a character, then click a level or track  ·  M toggles sound", W / 2, 430);
+                if (touchMode) {
+                    outlinedText(`TAP A CHARACTER, THEN TAP A ${kart ? "TRACK" : "LEVEL"} TO PLAY`, W / 2, 408);
+                    ctx.fillStyle = "#ccc";
+                    ctx.font = "12px monospace";
+                    ctx.fillText("Switch between Adventure and Kart Racing with the tabs above", W / 2, 430);
+                } else {
+                    outlinedText(`←/→ character   ↑/↓ ${kart ? "track" : "level"}   Tab mode   Enter start`, W / 2, 408);
+                    ctx.fillStyle = "#ccc";
+                    ctx.font = "12px monospace";
+                    ctx.fillText("or click a character, then click a level or track  ·  M toggles sound", W / 2, 430);
+                }
                 ctx.textAlign = "left";
             }
 
@@ -2000,12 +2119,21 @@
             // =====================================================
             goToMenu();
 
-            function loop() {
-                update();
+            // run the game at exactly 60 updates a second, even on 120Hz screens
+            const STEP = 1000 / 60;
+            let lastTime = performance.now(), behind = 0;
+            function loop(now) {
+                behind += Math.min(250, now - lastTime); // don't try to catch up after a long pause
+                lastTime = now;
+                while (behind >= STEP) {
+                    update();
+                    behind -= STEP;
+                }
                 draw();
+                updateTouchControls();
                 requestAnimationFrame(loop);
             }
-            loop();
+            requestAnimationFrame(loop);
         </script>
         <script src="kart.js"></script>
     </body>
