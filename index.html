@@ -41,12 +41,19 @@
             .cluster.right { right: max(14px, env(safe-area-inset-right)); }
             .cluster.top { bottom: auto; top: 70px; right: max(14px, env(safe-area-inset-right)); gap: 10px; }
 
-            #rotate {
-                display: none; position: fixed; inset: 0; z-index: 10; padding: 24px;
-                background: #111; color: #fff; font: bold 20px monospace;
-                align-items: center; justify-content: center; text-align: center;
+            /* phone held upright: game screen on top, bigger buttons underneath (like a Game Boy) */
+            @media (orientation: portrait) {
+                /* push the screen down a bit on tall phones, but keep room for the buttons on short ones */
+                body.touch { --gap: clamp(16px, calc(100vh - 56.25vw - 440px), 12vh); }
+                body.touch { align-content: start; padding-top: calc(env(safe-area-inset-top) + var(--gap)); box-sizing: border-box; }
+                body.touch #touch button { width: 84px; height: 84px; }
+                body.touch #touch button.big { width: 100px; height: 100px; }
+                body.touch #touch button.mini { width: 44px; height: 44px; }
+                body.touch .cluster { bottom: calc(env(safe-area-inset-bottom) + 28px); }
+                body.touch .cluster.right { flex-direction: column; align-items: center; }
+                /* sound + menu buttons sit just under the game screen (which is 56.25vw tall) */
+                body.touch .cluster.top { top: calc(env(safe-area-inset-top) + var(--gap) + 56.25vw + 14px); bottom: auto; }
             }
-            @media (orientation: portrait) { body.touch #rotate { display: flex; } }
         </style>
     </head>
     <body>
@@ -67,7 +74,6 @@
                 <button data-key="Escape" data-tap class="mini">☰</button>
             </div>
         </div>
-        <div id="rotate">Turn your phone sideways to play ↻</div>
         <script>
             const canvas = document.getElementById("game");
             const ctx = canvas.getContext("2d");
