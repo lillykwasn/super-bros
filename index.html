@@ -58,7 +58,8 @@
             </div>
             <div class="cluster right">
                 <button data-key="ArrowDown" class="kart-only label">BRAKE</button>
-                <button data-key="Space" class="kart-only big">ITEM</button>
+                <button data-key="Space" class="kart-only label">ITEM</button>
+                <button data-key="ArrowUp" class="kart-only big">GAS</button>
                 <button data-key="Space" class="adv-only big">JUMP</button>
             </div>
             <div class="cluster top">
@@ -2135,6 +2136,7 @@
             }
             requestAnimationFrame(loop);
         </script>
-        <script src="kart.js"></script>
+        <!-- bump the ?v= number when kart.js changes so phones don't use an old saved copy -->
+        <script src="kart.js?v=3"></script>
     </body>
 </html>

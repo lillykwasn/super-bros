@@ -564,9 +564,8 @@ const Kart = (() => {
         } else {
             if (keys["ArrowLeft"] || keys["KeyA"]) { p.offset -= dx; steer = -1; }
             if (keys["ArrowRight"] || keys["KeyD"]) { p.offset += dx; steer = 1; }
+            const gas = keys["ArrowUp"] || keys["KeyW"] || keys["KeyX"];
             const brake = keys["ArrowDown"] || keys["KeyS"] || keys["KeyZ"];
-            // on phones the gas is always on, so you only need to steer
-            const gas = keys["ArrowUp"] || keys["KeyW"] || keys["KeyX"] || (touchMode && !brake);
             if (gas) p.speed += ACCEL * DT;
             else if (brake) p.speed += BRAKING * DT;
             else p.speed += DECEL * DT;
@@ -1152,7 +1151,7 @@ const Kart = (() => {
             ctx.lineWidth = 3;
             ctx.fillStyle = "#fff";
             outlinedText(touchMode
-                ? "Steer with ◀ ▶  ·  gas is automatic  ·  BRAKE and ITEM on the right"
+                ? "Hold GAS to drive  ·  steer with ◀ ▶  ·  ITEM uses your item"
                 : "↑ gas   ↓ brake   ←/→ steer   Space use item   Esc menu", W / 2, H - 60);
         }
         if (banner) {
